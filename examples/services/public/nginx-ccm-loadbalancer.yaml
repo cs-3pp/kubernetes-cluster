@@ -1,0 +1,57 @@
+# Example: nginx exposed via CloudSigma CCM LoadBalancer controller
+#
+# Prerequisites:
+#   - KdcCluster with infrastructureProvider: cloudsigma(auto)
+#   - cloudsigma.com/owner-email annotation set on KdcCluster(auto)
+#   - CloudSigma account has subscribed (static) IPs available(manual)
+#
+# The CCM will:
+#   1. Discover available IPs from your CloudSigma account
+#   2. Attach the IP to the worker node via CloudSigma API (enables cross-subnet routing)
+#   3. Switch the node NIC to manual mode (opens CloudSigma firewall)
+#   4. Configure the IP locally on the node + iptables DNAT rules
+#   5. Tag the IP in CloudSigma with cluster/service metadata
+#   6. Handle failover — moves IP to another node if current node becomes unhealthy
+#
+# IP Pool Type (optional annotation):
+#   cloudsigma.com/ip-pool: "static"  (default) — uses subscribed IPs
+#   cloudsigma.com/ip-pool: "dynamic"           — uses unassigned floating IPs, in development
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-public
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx-public
+  template:
+    metadata:
+      labels:
+        app: nginx-public
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-public
+  namespace: default
+  annotations:
+    # Optional: specify IP pool type (default: "static")
+    # cloudsigma.com/ip-pool: "static"
+spec:
+  type: LoadBalancer
+  selector:
+    app: nginx-public
+  ports:
+  - port: 80
+    targetPort: 80
+    protocol: TCP
+  # The CCM will populate status.loadBalancer.ingress with the allocated IP

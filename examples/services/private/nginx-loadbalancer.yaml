@@ -1,0 +1,41 @@
+# Example: nginx exposed on the customer private VLAN via MetalLB.
+# Requires metallb-customer-vlan.yaml to be applied first.
+#
+# After applying, verify from any VM on the customer VLAN (10.8.0.0/24):
+#   curl http://10.8.0.9/
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  namespace: default
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: 10.8.0.9
+spec:
+  type: LoadBalancer
+  selector:
+    app: nginx
+  ports:
+  - port: 80
+    targetPort: 80

@@ -1,0 +1,34 @@
+# MetalLB configuration for customer private VLAN service exposure.
+# Deploy this on the customer cluster (e.g. remote-vlan) after installing MetalLB.
+#
+# The L2Advertisement is pinned to `ens4` — the worker NIC on the customer VLAN.
+# The IP pool must be within the customer VLAN subnet (e.g. 10.8.0.0/24).
+# IPs in the pool must not be in the DHCP range (dnsmasq: 10.8.0.10–10.8.0.250).
+# Safe range for static VIPs: 10.8.0.2–10.8.0.9
+#
+# Install MetalLB first:
+#   kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+#
+# Note: The MetalLB validating webhook cannot be reached from a Kube-DC-hosted
+# kube-apiserver. Delete it after install:
+#   kubectl delete validatingwebhookconfiguration metallb-webhook-configuration
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: customer-vlan-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 10.8.0.2-10.8.0.9
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: customer-vlan-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - customer-vlan-pool
+  interfaces:
+  - ens4
