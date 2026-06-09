@@ -1,0 +1,382 @@
+# Encryption at Rest — Design of the Managed Kubernetes Service
+
+This page explains how etcd encryption-at-rest works on the CloudSigma managed Kubernetes service: the key hierarchy (DEK / KEK / Root), how your cluster's control plane uses these keys to seal every value it writes to disk, and how the underlying OpenBao key store keeps your keys **strictly isolated from every other tenant**.
+
+The goal is to give you enough of the architecture to:
+
+- Decide which clusters need encryption-at-rest turned on
+- Reason about the blast radius if a worker node, a disk, or a backup tarball is stolen
+- Understand which knobs you control (rotation cadence, scope of encrypted resources) vs. which we operate on your behalf
+
+> **Audience.** You manage your cluster through the CloudSigma marketplace UI and use the downloaded `kubeconfig` for `kubectl` against your own cluster. You do **not** see or manage the OpenBao instance, the KMS plugin sidecar, or the key-binding policies — those are operator-side. But the model is open, so you can audit what's happening and reason about guarantees.
+
+---
+
+## TL;DR
+
+1. **Each cluster you opt into encryption-at-rest gets its own Key Encryption Key (KEK)** stored in OpenBao Transit. The KEK never leaves OpenBao in plaintext — every operation is `wrap` / `unwrap` on the OpenBao side.
+2. **Every encrypted etcd row carries its own Data Encryption Key (DEK)** — generated fresh, used for one row, then discarded. The DEK on disk is itself wrapped by the KEK.
+3. **Three layers of isolation in OpenBao:** OpenBao Namespace per **Organization** (the hard tenant boundary — namespaces are a kernel-level barrier in OpenBao, cross-namespace reads return 404), per-project mount inside the Namespace, and per-cluster Transit key inside the project mount.
+4. **The control plane uses a KMS-v2 sidecar.** Your cluster's `kube-apiserver` runs alongside a small gRPC server (the KMS plugin) on a Unix Domain Socket. The apiserver asks the sidecar to `wrap` or `unwrap` DEKs; the sidecar forwards to OpenBao Transit; OpenBao does the symmetric crypto. Plaintext DEKs exist only in the apiserver's process memory.
+5. **Authentication uses Kubernetes-native ServiceAccount tokens.** The sidecar authenticates to OpenBao with its own projected SA token, which OpenBao validates via the Kubernetes auth method — no static credentials live on disk.
+6. **You opt in per cluster** with a single field on cluster creation: `spec.encryption.etcd.enabled: true`. You can also opt into scheduled KEK rotation (`kekRotation: { enabled: true, interval: 90d }`).
+7. **Existing data re-encrypts on next write.** To force a one-shot re-encrypt of all Secrets in a cluster after enabling, run `kubectl get secret -A -o yaml | kubectl replace --force -f -`.
+
+---
+
+## 1. What this protects — and what it doesn't
+
+| Threat | Mitigated by etcd encryption-at-rest? |
+|---|---|
+| Someone with raw disk access to the etcd PVC of your cluster's control plane reads Secrets | ✅ Yes — they see ciphertext only, and the wrapping KEK lives in a different system (OpenBao). |
+| Someone with raw disk access to a backup tarball reads Secrets | ✅ Yes — backups inherit the same envelope, the snapshot is also wrapped by your KEK. |
+| A privileged operator on the management cluster reads your Secrets | ⚠️ Partially — operators with both raw etcd access **and** OpenBao decrypt permission on your Organization's namespace could decrypt. Operators have audit logs against the OpenBao side; cross-tenant reads are blocked by OpenBao Namespace isolation. |
+| Compromised workload running INSIDE your cluster reads its own Secrets through the apiserver | ❌ No — your apiserver decrypts transparently for any caller who can do `kubectl get secret`. This is **encryption-at-rest, not access control**. Use Kubernetes RBAC for that. |
+| A worker node is stolen / a worker disk is imaged | ✅ Mostly N/A — worker nodes don't hold Secrets at rest; mounted Secrets exist only in tmpfs in pod containers. |
+| Your application data on PVCs (databases, files) | ❌ Not in scope. Use application-level encryption or an encrypted StorageClass. |
+
+The headline guarantee: **anyone who gets bit-for-bit copies of the etcd database file or a backup tarball, but not OpenBao access, sees ciphertext only.**
+
+---
+
+## 2. The three-key hierarchy
+
+Your data is sealed in three layers. Each layer wraps the one above it; only the bottom layer ever touches plaintext.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Plaintext Secret                  ← exists in your      │
+│  (e.g. `{"password":"hunter2"}`)     apiserver memory    │
+│                                      and pod tmpfs only  │
+└──────────────────────────────────────────────────────────┘
+                       ▲
+                       │ AES-256-GCM seal / open
+                       │
+┌──────────────────────────────────────────────────────────┐
+│  Data Encryption Key (DEK) — 256 bits, random,           │
+│  generated by kube-apiserver per row, used once          │
+└──────────────────────────────────────────────────────────┘
+                       ▲
+                       │ Transit wrap / unwrap
+                       │ (RPC: KMS v2 plugin ─► OpenBao)
+                       │
+┌──────────────────────────────────────────────────────────┐
+│  Key Encryption Key (KEK) — per-cluster, AES-256-GCM,    │
+│  lives in OpenBao Transit, NEVER LEAVES in plaintext     │
+└──────────────────────────────────────────────────────────┘
+                       ▲
+                       │ Stored encrypted with…
+                       │
+┌──────────────────────────────────────────────────────────┐
+│  OpenBao master / unseal key — held by platform          │
+│  operators, sealed at rest, requires multi-key unseal    │
+│  to bring OpenBao itself back online after restart       │
+└──────────────────────────────────────────────────────────┘
+```
+
+| Layer | Scope | Lifetime | Where it lives in plaintext |
+|---|---|---|---|
+| **DEK** (Data Encryption Key) | One row in etcd (one Secret, one ConfigMap key) | Microseconds — generated, used to seal/open, discarded | In `kube-apiserver` process memory only. Never on disk in plaintext. |
+| **KEK** (Key Encryption Key) | One cluster | Bounded by your `kekRotation.interval` (90d default if enabled) | **Never in plaintext outside OpenBao.** The KMS plugin sends DEKs to OpenBao for wrap/unwrap; the KEK stays inside. |
+| **OpenBao Root / Unseal** | Whole OpenBao deployment | Effectively permanent (rotated separately by ops) | Sealed at rest; brought into RAM only at unseal time. Multi-key Shamir split — no single operator can re-seal alone. |
+
+Why three layers and not two? Because the apiserver writes thousands of rows per second on a busy cluster; calling OpenBao for every row is too expensive. By using a per-row DEK locally and only calling OpenBao to wrap/unwrap the (small, 32-byte) DEKs, the hot path stays fast.
+
+On the wire / on disk, an encrypted row looks like:
+
+```
+k8s:enc:kms:v2:<plugin-name>:<wrapped-DEK-blob><AES-256-GCM-ciphertext>
+```
+
+`<wrapped-DEK-blob>` is OpenBao Transit's opaque ciphertext (`vault:vN:...`) for the DEK; `<AES-256-GCM-ciphertext>` is the actual Secret payload sealed by that DEK.
+
+---
+
+## 3. How your cluster's control plane uses these keys
+
+Your cluster's control plane (apiserver + controller-manager + scheduler + etcd) does not run on worker nodes. It runs in our shared platform — one isolated control plane per customer cluster — managed by a piece called Kamaji. When you opt into encryption-at-rest, two extra moving parts get added inside your apiserver Pod.
+
+### 3a. Write path — `kubectl apply -f secret.yaml`
+
+```
+                                                ┌─────────────────────────────┐
+                                                │ Your cluster's control      │
+                                                │ plane Pod (one per cluster) │
+                                                └─────────────────────────────┘
+   kubectl apply         (HTTPS, your kubeconfig)  ┌─────────────────────┐
+   secret.yaml  ─────────────────────────────────► │  kube-apiserver     │
+                                                   └──────────┬──────────┘
+                                                              │
+                                                              │  1) generate DEK (32 random bytes)
+                                                              │  2) AES-256-GCM seal Secret with DEK
+                                                              │
+                                                              │  3) RPC: KMS v2 Encrypt(DEK)
+                                                              ▼
+                                                   ┌─────────────────────┐    HTTPS, SA token auth
+                                                   │  kms-plugin sidecar │ ──────────────────────► OpenBao Transit
+                                                   │  (gRPC over UDS)    │ ◄──────────────────────  wrap(DEK) → vault:v3:Aabc…
+                                                   └──────────┬──────────┘
+                                                              │  4) return wrapped DEK
+                                                              ▼
+                                                   ┌─────────────────────┐
+                                                   │  kube-apiserver     │
+                                                   └──────────┬──────────┘
+                                                              │  5) write to etcd:
+                                                              │     k8s:enc:kms:v2:…:<wrapped-DEK><ciphertext>
+                                                              ▼
+                                                   ┌─────────────────────┐
+                                                   │  etcd (control-     │
+                                                   │  plane PVC)         │
+                                                   └─────────────────────┘
+```
+
+Key points:
+
+- The Secret payload **never leaves your apiserver process**. The KMS plugin only sees the 32-byte DEK.
+- OpenBao only sees the DEK, never the Secret. Even if OpenBao's own audit log were leaked, it would not contain your Secret values.
+- The wrapped DEK plus the AES-256-GCM ciphertext is what hits the disk.
+
+### 3b. Read path — `kubectl get secret`
+
+```
+   kubectl get secret  ─────────────────────────► kube-apiserver
+                                                     │
+                                                     │  1) read row from etcd
+                                                     │     → k8s:enc:kms:v2:…:<wrapped-DEK><ciphertext>
+                                                     │
+                                                     │  2) cache hit? skip to step 5.
+                                                     │     (apiserver maintains an LRU of unwrapped DEKs,
+                                                     │      reducing OpenBao calls for repeat reads)
+                                                     │
+                                                     │  3) RPC: KMS v2 Decrypt(wrapped DEK)
+                                                     ▼
+                                            kms-plugin sidecar ────► OpenBao Transit
+                                                     │                  unwrap(vault:v3:Aabc…)
+                                                     │  4) return plaintext DEK
+                                                     ▼
+                                                  kube-apiserver
+                                                     │  5) AES-256-GCM open ciphertext with DEK
+                                                     │  6) return plaintext Secret to caller
+                                                     ▼
+   kubectl receives {"password":"hunter2"}
+```
+
+Cache lifetime: the apiserver's LRU is bounded (a few thousand entries, ~5 minute TTL). Cold reads round-trip to OpenBao; warm reads don't. On a healthy cluster this caches all "current" workload Secrets in a few hundred milliseconds of warm-up.
+
+### 3c. What runs in your control-plane Pod
+
+The sidecar is a small Go program that implements the upstream Kubernetes KMS v2 gRPC contract. It runs as a **Kubernetes 1.29+ native sidecar** (init container with `restartPolicy: Always`), so it starts before the apiserver and gets restarted with the same lifecycle as the apiserver process. It:
+
+- Listens on a Unix Domain Socket inside the apiserver Pod (no network exposure)
+- Authenticates to OpenBao with a projected ServiceAccount token (rotated by Kubernetes every hour)
+- Forwards every `EncryptDEK` / `DecryptDEK` request to your cluster's OpenBao Transit key
+
+You don't deploy or manage this sidecar — it's wired into the control plane automatically when you turn on encryption-at-rest for the cluster.
+
+### 3d. What about ConfigMaps?
+
+By default, only `Secrets` are encrypted at rest (matches the upstream Kubernetes default). You can widen the scope at cluster creation to include `ConfigMaps` as well — the marketplace surfaces this as a multi-select on the encryption setting. ConfigMaps go through the exact same DEK→KEK→OpenBao path.
+
+Resources NOT covered (`Leases`, `Events`, `Endpoints`, `Pods`) stay plaintext on disk because they have high write rates and low sensitivity — encrypting them multiplies apiserver and KMS load without a proportional security gain.
+
+---
+
+## 4. OpenBao multi-tenancy — how your keys stay yours
+
+OpenBao is shared infrastructure: one OpenBao cluster per CloudSigma region serves every customer in that region. The isolation between you and the next customer is the most important property of the design. Here's the layered model.
+
+### 4a. Layer-by-layer isolation
+
+```
+                          ┌──────────────────────────────────────────────────────┐
+                          │                  OpenBao cluster                     │
+                          │              (one per CloudSigma region)             │
+                          │                                                      │
+                          │  ┌──────────────────────────────────────────────────┐│
+                          │  │  Root namespace ("/")                            ││
+                          │  │  ─ ops-only; no customer touches this            ││
+                          │  └──────────────────────────────────────────────────┘│
+                          │                                                      │
+                          │  ┌──────────────────────────────────────────────────┐│
+   Your Organization      │  │  YourOrg's namespace (e.g. "tsap/")              ││
+   ──────────────────────►│  │  HARD ISOLATION BOUNDARY                         ││
+                          │  │  ─ cross-namespace reads return 404, ALWAYS      ││
+                          │  │                                                  ││
+                          │  │  ┌──────────────────────────────────────────────┐││
+                          │  │  │ kubernetes/   (Kubernetes auth method)       │││
+                          │  │  │                                              │││
+                          │  │  │   Roles:                                     │││
+                          │  │  │   ─ <cluster>-kms-plugin                     │││
+                          │  │  │       SA: <cluster>-kms-plugin               │││
+                          │  │  │       Policies: <cluster>-etcd-policy        │││
+                          │  │  └──────────────────────────────────────────────┘││
+                          │  │                                                  ││
+                          │  │  ┌──────────────────────────────────────────────┐││
+                          │  │  │ <project>/transit/       (one mount per      │││
+                          │  │  │                            tenant project)   │││
+                          │  │  │                                              │││
+                          │  │  │   keys/                                      │││
+                          │  │  │   ─ <cluster>-etcd       ← your KEK          │││
+                          │  │  │   ─ some-app-key         (other project keys)│││
+                          │  │  │   ─ archive-2026                             │││
+                          │  │  └──────────────────────────────────────────────┘││
+                          │  └──────────────────────────────────────────────────┘│
+                          │                                                      │
+                          │  ┌──────────────────────────────────────────────────┐│
+   Other Organizations    │  │  OtherOrg1's namespace, OtherOrg2's namespace…   ││
+   ──────────────────────►│  │  (identical structure, mutually invisible)        ││
+                          │  └──────────────────────────────────────────────────┘│
+                          └──────────────────────────────────────────────────────┘
+```
+
+Three nested boundaries:
+
+1. **OpenBao Namespace per Organization.** OpenBao's namespace feature is a kernel-level isolation primitive — a token issued in `tsap/` literally cannot read anything in `otherorg/`; the OpenBao server returns 404, not "permission denied". This means a policy bug at the project level cannot escalate to a cross-Organization read.
+2. **Per-project Transit mount inside the Org namespace.** Each project gets its own `<project>/transit/` mount. A bug in one project's policy can't leak into a sibling project's keys.
+3. **Per-cluster key inside the project mount.** Each cluster's KEK has a unique name `<project>-<cluster>-etcd`. Per-key ACL paths in the OpenBao policy further narrow which roles can `wrap`/`unwrap`/`rotate`.
+
+### 4b. How the binding gets created
+
+When you create a cluster with encryption enabled, the platform performs these steps in order:
+
+1. **Ensure your Organization's OpenBao namespace exists** (only on first cluster in the Org; idempotent thereafter — namespaces are the hard isolation boundary)
+2. **Ensure your project's Transit mount exists** inside that Organization namespace
+3. **Create the cluster's KEK** as a fresh AES-256-GCM key under the project mount
+4. **Provision the cluster's auth binding:**
+   - A Kubernetes ServiceAccount, scoped to the cluster's control-plane namespace
+   - An OpenBao ACL policy allowing **only** `encrypt` and `decrypt` on this one key — nothing else, no read of key material, no export, no creation of new keys
+   - An OpenBao Kubernetes-auth role binding the ServiceAccount to the policy
+5. **Patch the apiserver Pod** to mount the projected SA token, run the KMS plugin sidecar, and pass `--encryption-provider-config=...` to the apiserver
+
+The policy is forward-declared in step 4 **before** the SA is created in step 5 — this is intentional and lets OpenBao accept the binding immediately without races during cluster bootstrap.
+
+### 4c. Why a per-cluster KEK and not a per-project / per-Org one?
+
+We considered both. Per-cluster keys are the right granularity because:
+
+- **Blast radius.** Compromise of one cluster's SA token reveals only that cluster's KEK access, not every cluster in the project.
+- **Rotation independence.** You can rotate one cluster's KEK on a 90-day schedule without rolling DEKs for unrelated clusters.
+- **Decommission cleanly.** Deleting a cluster also deletes the per-cluster KEK after a 30-day grace period — no abandoned keys cluttering the namespace.
+
+The trade-off is one more Transit key per cluster, which OpenBao handles trivially (millions of keys per Transit mount is supported).
+
+---
+
+## 5. Component map — the full picture
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                        CloudSigma managed-K8s region                           │
+│                                                                                │
+│  ┌─────────────────────────────────┐    ┌─────────────────────────────────┐    │
+│  │ Your cluster's control plane    │    │ OpenBao cluster                 │    │
+│  │ Pod (Kamaji-managed)            │    │ (HA Raft, 3+ nodes)             │    │
+│  │                                 │    │                                 │    │
+│  │ ┌──────────┐  UDS   ┌─────────┐ │    │ Namespace: <YourOrg>/           │    │
+│  │ │kube-     │ ◄────► │ KMS     │ │    │   └─ <project>/transit/         │    │
+│  │ │apiserver │ KMS v2 │ plugin  │ │HTTPS│       └─ keys/<cluster>-etcd ──┼────┼─── KEK
+│  │ └────┬─────┘        │ sidecar │ ├───►│           (AES-256-GCM, v1)    │    │
+│  │      │              └─────────┘ │SA  │                                 │    │
+│  │      ▼                          │tok │ Kubernetes auth role:           │    │
+│  │ ┌──────────────┐                │en  │   ─ bound to your cluster's SA  │    │
+│  │ │ etcd         │                │    │   ─ allowed ONLY:               │    │
+│  │ │ (per-cluster │                │    │       encrypt/<cluster>-etcd    │    │
+│  │ │  PVC)        │                │    │       decrypt/<cluster>-etcd    │    │
+│  │ └──────────────┘                │    │                                 │    │
+│  └─────────────────────────────────┘    └─────────────────────────────────┘    │
+│                                                                                │
+│  ┌─────────────────────────────────┐                                           │
+│  │ Backup CronJob                  │                                           │
+│  │ ─ etcd snapshot                 │   ──── wraps snapshot DEK with same  ──┐  │
+│  │ ─ generate DEK                  │        cluster KEK ──────────────────► │  │
+│  │ ─ AES-256-GCM seal              │                                        │  │
+│  │ ─ upload to S3                  │                                        ▼  │
+│  └─────────────────────────────────┘                            ┌─────────────┐│
+│                                                                 │ S3 / object ││
+│                                                                 │ storage     ││
+│                                                                 │             ││
+│                                                                 │ <cluster>/  ││
+│                                                                 │   snap-….   ││
+│                                                                 │   tar.gz    ││
+│                                                                 │   .enc      ││
+│                                                                 │   meta.json ││
+│                                                                 └─────────────┘│
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Encrypted backups inherit the same envelope: each snapshot file gets its own DEK, the DEK is wrapped by the **same** cluster KEK, and the wrapped DEK + a `meta.json` (key id, KEK version at the time of backup, algorithm, hash) are uploaded next to the ciphertext. Restoring an encrypted backup requires OpenBao access to unwrap the DEK — anyone with bucket-read but no OpenBao access sees only ciphertext.
+
+---
+
+## 6. Enabling encryption on a cluster
+
+The CloudSigma marketplace surfaces this as a single option on cluster creation: **"Encrypt etcd data at rest"** with sub-options for `Secrets only` (default) or `Secrets + ConfigMaps`, and a separate toggle for `Enable scheduled key rotation` with a duration field. Set it and click create — the platform provisions the per-cluster KEK in OpenBao, wires the KMS plugin sidecar into your apiserver Pod, and starts your cluster encrypted from row #1.
+
+> **Today's clusters.** If your cluster is already running without encryption-at-rest, the option is **not retro-fittable in place** — the apiserver's `EncryptionConfiguration` is loaded at startup and changing it requires a control-plane rollout, which we currently only do on cluster creation. To get an existing cluster onto encryption-at-rest, create a new cluster with the option enabled and migrate workloads. (We're tracking in-place enablement on the roadmap — file a support request if it's a hard blocker for you.)
+
+Once a cluster is encrypted, existing Secret rows are re-encrypted automatically on the **next write** to that row. To force a one-shot re-encrypt of every Secret in the cluster (e.g. immediately after enabling, or after a KEK rotation), do:
+
+```bash
+kubectl get secret -A -o yaml | kubectl replace --force -f -
+```
+
+This rewrites every Secret in place. After it completes, every Secret row in etcd is using the current KEK version.
+
+---
+
+## 7. KEK rotation
+
+Encryption-at-rest by itself doesn't rotate the wrapping key — that needs scheduled rotation. The marketplace exposes this as **"Rotate the KEK every N days"** alongside the encryption toggle. Minimum interval is 7 days; recommended default is 90 days for production clusters.
+
+What rotation does:
+
+1. OpenBao bumps the KEK to `vN+1`. Old versions stay alive for **decryption** of existing data.
+2. New writes use `vN+1` to wrap their DEKs.
+3. Old data is silently re-wrapped to `vN+1` on the next write to each row. For a full immediate re-wrap of every existing Secret, run the same `kubectl replace --force` trick from §6.
+4. Your cluster's status surfaces the current KEK version in the marketplace UI so you can confirm rotation happened.
+
+What rotation does **not** do:
+
+- It doesn't rotate the OpenBao root or the unseal key — those are operator-managed and rotated on a separate schedule.
+- It doesn't invalidate old ciphertext. The whole point of a KEK rotation is that you can decrypt old data while new writes use a fresh KEK.
+- It doesn't re-key your application keys (if you also use the KMS service for application-level encryption — those are separate keys with separate rotation schedules you control independently).
+
+---
+
+## 8. What you control vs. what we operate
+
+| You | Us (operator side) |
+|---|---|
+| Decide which clusters get encryption (per-cluster opt-in at creation) | OpenBao cluster availability + unseal |
+| Decide rotation cadence (KEK rotation interval) | OpenBao backup, restore, recovery from disaster |
+| Decide encrypted scope (Secrets only vs. Secrets + ConfigMaps) | OpenBao Namespace creation when your Organization is created |
+| Inspect status via the marketplace UI (current KEK version, sidecar health) | Per-cluster KEK creation, Kubernetes-auth role binding |
+| Force re-encrypt of existing data via `kubectl replace --force` | KMS plugin sidecar rollouts (with apiserver upgrades) |
+| — | Audit log retention on the OpenBao side (every `wrap` / `unwrap` is logged) |
+
+You never see, touch, or need to know the OpenBao credentials used by your cluster's KMS plugin. They are projected ServiceAccount tokens, rotated by Kubernetes every hour, validated by OpenBao via the Kubernetes auth method — no static secrets exist on disk.
+
+---
+
+## 9. Failure modes — what happens when something breaks
+
+| Failure | Effect on your cluster |
+|---|---|
+| OpenBao briefly unavailable (failover, restart) | apiserver writes that need NEW DEKs **block** until OpenBao is back (typically <10s); cached reads continue uninterrupted; you may see `kubectl create secret` hang for a few seconds. |
+| OpenBao unavailable for an extended period | apiserver returns `Internal Server Error` on Secret/ConfigMap writes; reads of recently-accessed Secrets still work from the LRU cache. Your **existing workloads** keep running — they already have their Secrets projected into pod tmpfs. |
+| OpenBao sealed (after a restart, before unseal) | Same as "unavailable for an extended period" until ops unseals OpenBao. |
+| KEK deleted | Catastrophic — any encrypted etcd row whose DEK was wrapped by that KEK is unrecoverable. This is why the per-cluster KEK has a **30-day soft-delete grace period** (`deletionPolicy: retain` is the default); deleting a cluster does NOT immediately delete its KEK. |
+| Sidecar crash | Native sidecar lifecycle restarts it; if it can't reach OpenBao on startup, the apiserver also fails to start (intentional fail-closed: a half-up apiserver that couldn't reach KMS would silently store new writes in plaintext — that's the failure mode we deliberately avoid). |
+| Network partition between sidecar and OpenBao | Same as OpenBao unavailable; sidecar surfaces the error in apiserver logs. |
+
+Everything except "KEK deleted" is self-healing once the underlying issue is resolved.
+
+---
+
+## 10. References
+
+- Upstream Kubernetes KMS v2 specification — [KEP-3299](https://github.com/kubernetes/enhancements/blob/master/keps/sig-auth/3299-kms-v2-improvements/README.md)
+- OpenBao project — [openbao.org](https://openbao.org/)
+- OpenBao Transit secrets engine — [openbao.org/docs/secrets/transit](https://openbao.org/docs/secrets/transit/)
+- OpenBao Kubernetes auth method — [openbao.org/docs/auth/kubernetes](https://openbao.org/docs/auth/kubernetes/)
+- Backups + restore mechanics: [`cluster-upgrades.md`](./cluster-upgrades.md) (worker rollouts) — backup tarballs reference §5 of this page for the envelope format.
