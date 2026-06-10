@@ -171,13 +171,13 @@ The platform that hosts your cluster's control plane has its own apiserver (sepa
    Operator's laptop                            Management cluster
    ────────────────                             ──────────────────
                                                 ┌──────────────────────┐
-   `<platform-cli> login --admin`                │ Keycloak             │
+   `<platform-cli> login --admin`               │ Keycloak             │
    (the operator CLI) ── 1. opens browser ─────►│  master realm        │
                                                 │  → admin group       │
                                                 │                      │
                   ◄── 2. JWT (15 min lifetime) ─┤                      │
                                                 └──────────────────────┘
-                  ─── 3. kubectl with JWT ──────►┌──────────────────────┐
+                  ─── 3. kubectl with JWT ─────►┌──────────────────────┐
                                                 │ Apiserver            │
                                                 │  ─ OIDC validates JWT│
                                                 │  ─ admin group →     │

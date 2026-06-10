@@ -275,7 +275,7 @@ The trade-off is one more Transit key per cluster, which OpenBao handles trivial
 │  │ ┌──────────┐  UDS   ┌─────────┐ │    │ Namespace: <YourOrg>/           │    │
 │  │ │kube-     │ ◄────► │ KMS     │ │    │   └─ <project>/transit/         │    │
 │  │ │apiserver │ KMS v2 │ plugin  │ │HTTPS│       └─ keys/<cluster>-etcd ──┼────┼─── KEK
-│  │ └────┬─────┘        │ sidecar │ ├───►│           (AES-256-GCM, v1)    │    │
+│  │ └────┬─────┘        │ sidecar │ ├───►│           (AES-256-GCM, v1)     │    │
 │  │      │              └─────────┘ │SA  │                                 │    │
 │  │      ▼                          │tok │ Kubernetes auth role:           │    │
 │  │ ┌──────────────┐                │en  │   ─ bound to your cluster's SA  │    │
