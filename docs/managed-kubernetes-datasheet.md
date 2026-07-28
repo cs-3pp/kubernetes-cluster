@@ -1,0 +1,612 @@
+# Managed Kubernetes Service — Platform Capabilities
+
+**Document status:** Customer-facing capabilities datasheet
+**Applies to:** CloudSigma Managed Kubernetes, powered by Kube-DC
+**Companion to:** *CloudSigma Platform Capabilities* (sections 1–16)
+
+---
+
+## Introduction
+
+CloudSigma Managed Kubernetes delivers production-grade, CNCF-conformant Kubernetes clusters on the CloudSigma cloud without requiring customers to build, operate or upgrade a control plane. Customers provision a cluster from the CloudSigma marketplace WebApp in minutes, download a `kubeconfig`, and immediately use standard `kubectl`, Helm and any Kubernetes-native tooling against a cluster that behaves exactly like upstream Kubernetes — because it *is* upstream Kubernetes.
+
+The service is built on the same design philosophy as the wider CloudSigma platform: open standards, no proprietary burden, no vendor lock-in. Every cluster runs unmodified upstream Kubernetes with a curated set of open-source add-ons. Workloads, manifests and Helm charts move on and off the platform unchanged. There are no CloudSigma-specific API extensions a customer is obliged to adopt, and no re-architecting is required to run existing Kubernetes workloads.
+
+What CloudSigma operates on the customer's behalf is the *undifferentiated* half of Kubernetes: the control plane (API server, scheduler, controller manager and etcd), its high availability, its backups, its encryption keys, its upgrades and the platform add-ons that make a cluster usable. What the customer keeps is the half that carries their business logic: namespaces, workloads, storage claims, network policy, RBAC and node pool sizing. This boundary is explicit, documented, and enforced technically rather than by convention.
+
+The service covers a range of deployment shapes — from a single-pool development cluster reachable over the public internet, to a multi-pool production cluster with encryption-at-rest, scheduled etcd backups and an API endpoint reachable only from the customer's own private VLAN.
+
+---
+
+## 1. Service Architecture Overview
+
+The managed Kubernetes service is built on a **hosted control plane** model. Each customer cluster's control plane runs as a set of pods inside a CloudSigma-operated management cluster, while the worker nodes run as ordinary KVM virtual machines inside the customer's own CloudSigma account.
+
+This split is the defining architectural decision of the service and it produces most of its operational advantages:
+
+- **No control-plane VMs on the customer's bill.** The customer pays for worker nodes and storage — the resources that actually run their workloads. There are no three master VMs sitting idle to fund.
+- **Control-plane high availability is automatic.** The control plane is a Kubernetes Deployment inside a highly available management cluster. Failover is pod rescheduling, measured in seconds, and requires no customer action.
+- **Control-plane upgrades are decoupled from worker upgrades.** A control-plane version bump is a rolling Deployment update that does not touch a single customer workload.
+- **The blast radius of a worker-node failure is bounded.** Losing a worker node cannot damage the control plane or etcd, because they do not share a failure domain.
+
+```mermaid
+flowchart TB
+    USER(["Customer<br/>kubectl / Helm / CI"])
+
+    subgraph CUST["Your CloudSigma Account — your resources, your bill"]
+        direction LR
+        subgraph POOLA["Worker Pool A — general purpose"]
+            W1["Worker VM"]
+            W2["Worker VM"]
+        end
+        subgraph POOLB["Worker Pool B — high-memory / arm64"]
+            W3["Worker VM"]
+        end
+        VOL[("DSSD block storage<br/>PersistentVolumes")]
+    end
+
+    VLANC{{"Cloud VLAN — private, CloudSigma-internal<br/>kubelet · CCM · add-on traffic"}}
+
+    subgraph MGMT["CloudSigma Management Cluster — operated by CloudSigma"]
+        direction LR
+        subgraph CP["Your cluster's control plane (pods)"]
+            direction TB
+            API["kube-apiserver"]
+            KCM["kube-controller-manager"]
+            SCH["kube-scheduler"]
+            KONN["konnectivity-server"]
+            KMS["KMS v2 plugin<br/>(sidecar, optional)"]
+        end
+        ETCD[("etcd datastore<br/>shared or dedicated")]
+        BAO["OpenBao<br/>key store"]
+        OPR["Cluster operator<br/>CAPI + Kamaji"]
+    end
+
+    W1 --- VOL
+    W3 --- VOL
+    W1 --> VLANC
+    W2 --> VLANC
+    W3 --> VLANC
+    VLANC <--> API
+    USER -->|"kubeconfig — public or private endpoint"| API
+    API <--> ETCD
+    API -.-> KMS
+    KMS <--> BAO
+    OPR --> CP
+    OPR -.->|"provisions worker VMs<br/>via the CloudSigma API"| CUST
+
+    classDef csop fill:#e8f0fe,stroke:#4285f4,color:#000
+    classDef cust fill:#e6f4ea,stroke:#34a853,color:#000
+    classDef wire fill:#fef7e0,stroke:#f9ab00,color:#000
+    class MGMT,CP,ETCD,BAO,OPR,API,KCM,SCH,KONN,KMS csop
+    class CUST,POOLA,POOLB,VOL,W1,W2,W3 cust
+    class VLANC wire
+```
+
+*Managed Kubernetes Service Architecture — control plane operated by CloudSigma, worker nodes in the customer account*
+
+### 1.1. The management layer
+
+The management cluster hosts every customer cluster's control plane. It runs the cluster lifecycle operator, which reconciles a declarative cluster definition into: a control-plane Deployment, an etcd datastore binding, worker-node virtual machines provisioned through the CloudSigma API, network exposure objects, backup schedules and encryption key material.
+
+Control-plane hosting uses **Kamaji**, an open-source hosted-control-plane engine, driving unmodified upstream Kubernetes component images. Worker-node provisioning uses **Cluster API (CAPI)** with the CloudSigma infrastructure provider, so node lifecycle follows the same declarative, reconciliation-driven model that the rest of the Kubernetes ecosystem uses.
+
+The management cluster is unreachable from customer clusters. It has no public entry point other than a single bastion host with public-key-only SSH, and every configuration change to it flows through a reviewed, cryptographically signed GitOps repository. This is documented in full in [operator-access-controls.md](operator-access-controls.md).
+
+### 1.2. The customer layer
+
+Worker nodes are CloudSigma KVM virtual machines in the customer's own account, visible in the customer's WebApp alongside their other VMs, and billed through the same 5-minute utility pricing cycle as any other CloudSigma compute resource. They are dual-homed:
+
+- **Cloud VLAN NIC** — carries the private path between worker nodes and the cluster's API server, plus kubelet, CCM and add-on traffic. This is CloudSigma-internal routed infrastructure, not the public internet.
+- **Customer VLAN NIC (optional)** — the customer's own private VLAN, used to advertise LoadBalancer VIPs to other VMs on that VLAN and to host a private-only API endpoint.
+
+### 1.3. Division of responsibility
+
+| Layer | Operated by | Customer control |
+|---|---|---|
+| etcd datastore, backups, encryption keys | CloudSigma | Opt-in toggles, schedule, retention, rotation interval |
+| kube-apiserver, controller-manager, scheduler | CloudSigma | Target Kubernetes version; resource autoscaling mode |
+| konnectivity, cluster PKI, certificates | CloudSigma | None required — fully automatic |
+| Platform add-ons (CNI, DNS, CSI, CCM, MetalLB) | CloudSigma | Consume via standard Kubernetes objects |
+| Worker node VMs | CloudSigma provisions; customer owns | Count, size, image, architecture, labels, taints, version |
+| Kubelet tuning | CloudSigma applies | `maxPods`, reserved resources, eviction thresholds |
+| Namespaces, workloads, PVCs, Services, RBAC, NetworkPolicy | **Customer** | Full — never modified by CloudSigma |
+
+> **📷 Screenshot placeholder — `img/mk8s-01-cluster-list.png`**
+> *Capture: the Kubernetes cluster list in the CloudSigma marketplace WebApp, showing several clusters with their phase (Ready / Provisioning), Kubernetes version, endpoint and worker-node count.*
+
+---
+
+## 2. Cluster Provisioning & Lifecycle
+
+### 2.1. Cluster creation
+
+A cluster is created from the marketplace WebApp with a short guided form. The customer selects a name, a Kubernetes version from the supported catalogue, the cloud location, the initial worker pool shape (node count, CPU, memory, disk, image) and the network exposure mode. Optional toggles at creation time cover encryption-at-rest, scheduled etcd backups and a dedicated etcd datastore.
+
+Everything the form collects maps onto a declarative cluster object; nothing is imperative. The same cluster can therefore be reproduced, version-controlled or created through automation, and the platform continuously reconciles the running cluster back towards the declared state.
+
+```mermaid
+sequenceDiagram
+    participant U as Customer (WebApp)
+    participant OP as Cluster operator
+    participant K as Kamaji / control plane
+    participant CS as CloudSigma API
+    participant W as Worker VMs
+
+    U->>OP: Create cluster (version, pools, options)
+    OP->>K: Provision hosted control plane
+    K->>K: Generate PKI, bind etcd datastore
+    OP->>OP: Allocate API endpoint (public / private)
+    K-->>OP: Control plane Ready
+    OP->>CS: Create worker VMs (CAPI + CloudSigma provider)
+    CS->>W: Boot nodes, cloud-init
+    W->>K: kubeadm join over cloud VLAN
+    OP->>K: Deploy add-ons (CNI, DNS, CSI, CCM…)
+    K-->>U: Cluster Ready — kubeconfig available
+```
+
+*Cluster Provisioning Flow*
+
+### 2.2. Provisioning times
+
+| Stage | Typical duration |
+|---|---|
+| Hosted control plane Ready | 1–3 minutes |
+| First worker node joined and Ready | 2–15 minutes |
+| Add-ons reconciled, cluster fully usable | +1–2 minutes after first node |
+| Additional nodes in an existing pool | 2–15 minutes each, provisioned in parallel |
+
+Control-plane readiness is fast because it is pod scheduling rather than VM provisioning. Worker-node time is dominated by CloudSigma VM boot and image preparation, and varies with image size and cloud location.
+
+### 2.3. Kubernetes version support
+
+The platform maintains a catalogue of supported Kubernetes minor versions, kept close to upstream. Customers select a version at creation and move between versions through the upgrade wizard (section 4). The version catalogue is surfaced in the WebApp so customers always see exactly what is available to create and to upgrade to.
+
+### 2.4. Day-2 operations
+
+All lifecycle operations are available after creation without recreating the cluster:
+
+- **Add, resize or remove worker pools** — pools are independent objects; adding a pool never disturbs existing ones.
+- **Scale a pool up or down**, including **scale to zero** to park a pool's cost without deleting its configuration.
+- **Upgrade the control plane and each pool independently.**
+- **Toggle the public API endpoint** on or off.
+- **Enable or disable scheduled backups** and change schedule or retention.
+- **Enable encryption-at-rest** and opt into scheduled key rotation.
+
+> **📷 Screenshot placeholder — `img/mk8s-02-create-wizard.png`**
+> *Capture: the Create Cluster wizard — name, Kubernetes version, location, and the first worker pool sizing controls (CPU, RAM, disk, node count).*
+
+> **📷 Screenshot placeholder — `img/mk8s-03-cluster-summary.png`**
+> *Capture: the cluster Summary tab of a Ready cluster — phase, version, API endpoint, control-plane status and worker-pool rollup.*
+
+---
+
+## 3. Worker Pools & Compute
+
+### 3.1. Pool model
+
+A cluster contains one or more **worker pools**. Each pool is a homogeneous group of nodes with its own size, image, Kubernetes version, labels, taints and rollout policy. Pools are the unit of scaling, upgrading and scheduling segregation.
+
+Because CloudSigma provisions CPU, RAM and storage independently rather than in fixed instance types, worker pools inherit that freedom directly. A pool is defined by the exact core count, memory and disk the workload needs, not by the nearest predefined instance size. This is the same "right-sizing" cost-control property that applies to CloudSigma VMs generally, applied to Kubernetes capacity.
+
+- **Heterogeneous pools** — mix small general-purpose nodes with high-memory or high-core pools in one cluster, and target them with `nodeSelector` or affinity rules.
+- **Multi-architecture** — `amd64` and `arm64` pools can coexist in the same cluster.
+- **Labels and taints** — set per pool and applied at node registration, so scheduling constraints survive node replacement.
+- **Per-pool Kubernetes version** — pools may deliberately lag the control plane within the supported skew window.
+- **Scale to zero** — a pool can be scaled to zero nodes and back without losing its definition.
+
+### 3.2. Kubelet configuration
+
+Kubelet parameters that materially affect node stability are configurable per cluster and applied consistently across nodes:
+
+- **`maxPods`** — the pod density ceiling per node, raised for large nodes running many small pods.
+- **`kubeReserved` / `systemReserved`** — CPU, memory and ephemeral-storage carve-outs that protect the kubelet and OS from workload pressure.
+- **`evictionHard`** — the thresholds at which the kubelet begins evicting pods, tuned to fire before the node's OOM killer does.
+
+Correct reservation values are the single most effective defence against node-level instability on large nodes. The platform applies conservative defaults and supports per-cluster overrides where a workload profile justifies them.
+
+### 3.3. Rollout safety controls
+
+Any operation that replaces nodes — an upgrade, an image change, a pool reconfiguration — honours the pool's rollout policy:
+
+| Control | Default | Purpose |
+|---|---|---|
+| `maxSurge` | 1 | Extra node provisioned before an old one is removed |
+| `maxUnavailable` | 0 | No capacity reduction during rollout |
+| `nodeDrainTimeoutSeconds` | Operator-set | Upper bound on graceful drain before forced removal |
+| Pause | Off | Freeze a rollout mid-flight from the WebApp |
+| PodDisruptionBudget | Customer-defined | Respected during every voluntary eviction |
+
+The `maxSurge=1, maxUnavailable=0` default is the safest possible setting: capacity never dips below the declared pool size. It is also the slowest, which is the correct trade-off for production clusters.
+
+> **📷 Screenshot placeholder — `img/mk8s-04-worker-pools.png`**
+> *Capture: the Workers tab showing two pools with differing shapes, their node counts, versions, phase, and the per-pool Pause / Scale controls.*
+
+---
+
+## 4. Cluster Upgrades
+
+Upgrades are **staged**: the control plane and each worker pool move independently, under customer control, with a pause button at every step. This is the mechanism that makes upgrading a large production cluster a controlled sequence of small, reversible decisions rather than one irreversible event.
+
+```mermaid
+flowchart TB
+    A["1 — Upgrade control plane<br/><i>control-plane-only mode</i>"] --> A1{"Control plane<br/>healthy?<br/>Smoke tests pass?"}
+    A1 -->|No| AX["Stop — workers untouched,<br/>workloads unaffected"]
+    A1 -->|Yes| B["2 — Upgrade worker pool A<br/><i>maxSurge=1, maxUnavailable=0</i>"]
+    B --> B1{"First node<br/>rolled cleanly?"}
+    B1 -->|No| BX["Pause pool from WebApp<br/>investigate, resume or roll back"]
+    B1 -->|Yes| C["3 — Complete pool A,<br/>then pools B, C… one at a time"]
+    C --> D["Cluster fully upgraded"]
+
+    classDef ok fill:#e6f4ea,stroke:#34a853,color:#000
+    classDef warn fill:#fce8e6,stroke:#ea4335,color:#000
+    class A,B,C,D ok
+    class AX,BX warn
+```
+
+*Staged Upgrade Flow — control plane first, worker pools individually, pausable at any point*
+
+### 4.1. Why the control plane goes first
+
+Kubernetes permits worker kubelets to lag the control plane by up to two minor versions, but never to exceed it. Upgrading the control plane first is therefore the only valid ordering, and it has a useful property: **it does not touch customer workloads at all**. The control plane rolls as pods in the management cluster; no customer node is drained, no customer pod is evicted. Customers can validate the new control plane against their live workloads before committing to any node replacement.
+
+### 4.2. Worker pool upgrades
+
+Worker upgrades replace nodes rather than upgrading them in place. For each node, the platform provisions a replacement, waits for it to become Ready, cordons and drains the old node respecting PodDisruptionBudgets, then removes it. Pools upgrade one at a time and one node at a time by default.
+
+**Capacity planning remains a customer responsibility.** The platform does not verify that the remaining nodes in a pool can absorb the workloads evicted from the node being replaced. For pools running large stateful pods, the customer must confirm that headroom exists before starting — a pod that cannot be rescheduled will block the drain.
+
+### 4.3. Add-on lifecycle
+
+Platform add-ons are upgraded out-of-band by CloudSigma on their own cadence, independent of the Kubernetes version bump. A cluster upgrade does not change add-on versions, and an add-on update does not require a cluster upgrade.
+
+Full operational guidance, including recommendations for clusters with 20+ nodes and pods in the 50–100 GB range, is in [cluster-upgrades.md](cluster-upgrades.md).
+
+> **📷 Screenshot placeholder — `img/mk8s-05-upgrade-wizard.png`**
+> *Capture: the upgrade wizard — target version selection, pre-flight checks, and the control-plane-only vs. full-cluster mode choice.*
+
+---
+
+## 5. Autoscaling
+
+### 5.1. Control-plane vertical autoscaling — available
+
+Every managed control plane is continuously right-sized by a **Vertical Pod Autoscaler (VPA)**. The recommender observes actual CPU and memory consumption of the API server, controller manager and scheduler, and produces target, lower-bound and upper-bound recommendations that are surfaced on the cluster's status.
+
+This directly addresses the failure mode that statically sized control planes suffer under: an API server whose memory limit was set for a small cluster gets OOM-killed once the cluster's object count, CRD surface or list-watch traffic grows — taking `kubectl exec`, `kubectl logs`, the controller manager and the scheduler down with it.
+
+Four modes are supported:
+
+- **`Off`** — recommendation-only. Sizing signals are computed and reported, nothing is changed. Applied to every cluster as a baseline.
+- **`Initial`** — recommendations are injected when a control-plane pod is created, never applied by eviction.
+- **`Recreate`** — pods are evicted to apply new sizes. Effective but disruptive.
+- **`InPlaceOrRecreate`** *(default)* — uses Kubernetes 1.33+ in-place pod resize where possible, falling back to eviction only when in-place resize is not applicable. **CPU resizing is restart-free.**
+
+A per-cluster upper bound governs how large the recommender may go, so a single heavy tenant cannot exhaust management-cluster capacity through inflated resource requests. The bound is raised on request for clusters whose API server working set legitimately exceeds the default.
+
+```mermaid
+flowchart LR
+    M["Control-plane pods<br/>apiserver / KCM / scheduler"] -->|"CPU + memory<br/>usage metrics"| R["VPA recommender"]
+    R -->|"target / lower / upper<br/>bounds"| S["Cluster status<br/><i>visible to customer</i>"]
+    R --> U["VPA updater"]
+    U -->|"in-place resize<br/>(restart-free for CPU)"| M
+    U -.->|"fallback: evict + recreate"| M
+    CAP["Per-cluster max bound<br/><i>protects shared capacity</i>"] --> R
+
+    classDef n fill:#e8f0fe,stroke:#4285f4,color:#000
+    class M,R,S,U,CAP n
+```
+
+*Control-Plane Vertical Autoscaling Loop*
+
+### 5.2. Worker pool autoscaling — coming soon
+
+Horizontal autoscaling of worker pools is on the near-term roadmap. Once available, a pool will be given a minimum and maximum node count, and the platform will add nodes when pods are unschedulable for lack of capacity and remove nodes that have been underutilised and drainable for a sustained period — the standard Cluster Autoscaler contract, integrated with the CloudSigma provisioning API.
+
+Until it ships, worker capacity is changed by scaling a pool from the WebApp or through automation against the cluster API. Pool scaling is already a live, non-disruptive operation, so adopting autoscaling later will not require any change to cluster or workload configuration.
+
+**Workload autoscaling inside the cluster is available today and unaffected by the above.** `HorizontalPodAutoscaler` and `VerticalPodAutoscaler` for customer workloads work exactly as upstream, driven by the metrics pipeline running in every cluster.
+
+> **📷 Screenshot placeholder — `img/mk8s-06-autoscaling-status.png`**
+> *Capture: the control-plane sizing/recommendation panel showing the active autoscaling mode and current per-container recommendations.*
+
+---
+
+## 6. Storage
+
+Persistent storage is delivered by the **CloudSigma CSI driver**, which provisions PersistentVolumes backed by the platform's clustered NVMe/SSD block storage — the same triple-replicated, RDMA-accelerated storage system described in section 8 of the parent *Platform Capabilities* document, with its IOPS profile and node-failure characteristics.
+
+- **Default StorageClass** — `cloudsigma-dssd`. PVCs created without an explicit `storageClassName` bind to it automatically.
+- **Custom StorageClasses** — customers may create their own with different parameters, filesystem types, mount options or a `Retain` reclaim policy. Customer-created StorageClasses are never modified or removed by the platform.
+- **Dynamic provisioning** — volumes are created, attached and detached on demand as PVCs are created and pods are scheduled.
+- **Standard semantics** — `ReadWriteOnce` block volumes with the usual Kubernetes attach/detach and resize behaviour.
+
+Because the underlying storage replicates three copies across separate servers, a PersistentVolume survives drive, server and rack-level component failure without customer action and without data becoming even temporarily unavailable.
+
+**Object storage** for workloads that need it (artifacts, backups, media) is available from the CloudSigma object storage service and consumed from a cluster with any S3-compatible client or operator.
+
+> **📷 Screenshot placeholder — `img/mk8s-07-storage.png`**
+> *Capture: `kubectl get pvc,pv,storageclass` output in a cluster with a bound PVC on `cloudsigma-dssd`, or the equivalent WebApp storage view.*
+
+---
+
+## 7. Networking
+
+### 7.1. Container networking — Cilium
+
+Every cluster runs **Cilium** as its CNI, providing eBPF-based pod-to-pod networking and native enforcement of Kubernetes `NetworkPolicy` and `CiliumNetworkPolicy`. Customers author network policy as ordinary Kubernetes objects; the platform never modifies or removes customer policy.
+
+### 7.2. Cluster addressing
+
+Pod and Service CIDRs are configurable per cluster at creation, so a cluster's internal ranges can be chosen to avoid collision with the customer's existing VLAN and on-premises addressing.
+
+### 7.3. Load balancing
+
+Two complementary mechanisms serve `Service type=LoadBalancer`, selected by the cluster's network shape:
+
+- **CloudSigma Cloud Controller Manager (CCM)** — for internet-facing services. On creating a `type=LoadBalancer` Service, the CCM selects a subscribed static IP from the customer's CloudSigma account, attaches it to a worker node through the CloudSigma API, opens the node firewall and configures routing so traffic reaching that IP lands on the Service. A plain, unannotated `type=LoadBalancer` Service is sufficient — no platform-specific annotation is required.
+- **MetalLB** — for private-VLAN clusters. LoadBalancer VIPs are allocated from a pool on the customer's own VLAN and advertised at layer 2, making the Service reachable from other VMs on that VLAN without traversing the public internet.
+
+The CCM also performs the standard cloud-provider node lifecycle duties: labelling nodes with their region and instance topology, and removing Node objects for VMs that no longer exist.
+
+### 7.4. In-cluster API access
+
+A **kube-api-proxy** component runs in every cluster so that `kubernetes.default.svc` resolves and works normally from inside pods. This makes in-cluster controllers, operators, service meshes and admission webhooks function exactly as they would on a self-hosted cluster, despite the API server living outside the cluster's own network. It is transparent and requires no customer configuration.
+
+### 7.5. Cluster add-ons summary
+
+| Add-on | Role | Customer interface |
+|---|---|---|
+| Cilium | CNI, network policy | `NetworkPolicy`, `CiliumNetworkPolicy` |
+| CoreDNS | Cluster DNS | Standard service discovery |
+| kube-api-proxy | In-cluster API reachability | Transparent |
+| CloudSigma CSI | Block storage | `PersistentVolumeClaim`, `StorageClass` |
+| CloudSigma CCM | LoadBalancer + node lifecycle | `Service type=LoadBalancer` |
+| MetalLB | LoadBalancer on private VLAN | `Service type=LoadBalancer` |
+| konnectivity-agent | `exec` / `logs` / `port-forward` tunnel | Transparent |
+| Metrics pipeline | Resource metrics | `kubectl top`, HPA/VPA |
+
+Add-ons are continuously reconciled against a tested baseline, which keeps every cluster identical and predictable. Full per-add-on detail — what is configurable, what is reverted, and the common operations for each — is in [cluster-addons.md](cluster-addons.md).
+
+> **📷 Screenshot placeholder — `img/mk8s-08-network-tab.png`**
+> *Capture: the cluster Network tab — pod/service CIDRs, API endpoint configuration, VLAN attachment and LoadBalancer IP allocations.*
+
+---
+
+## 8. API Endpoints — Public, Private and Break-Glass
+
+Cluster API reachability is an explicit, changeable property of the cluster rather than a decision frozen at creation.
+
+```mermaid
+flowchart LR
+    subgraph EXT["Public internet"]
+        DEV(["Customer laptop / CI"])
+    end
+    subgraph VLAN["Customer private VLAN"]
+        BAS(["Customer bastion / VMs"])
+        VIP["Private API VIP<br/><i>MetalLB-advertised</i>"]
+    end
+    subgraph CS["CloudSigma platform"]
+        GW["Gateway<br/>TLS passthrough"]
+        API["kube-apiserver<br/>(hosted control plane)"]
+    end
+
+    DEV -->|"public kubeconfig<br/>TLS, opt-in"| GW --> API
+    BAS --> VIP -->|"private kubeconfig"| API
+
+    classDef pub fill:#fef7e0,stroke:#f9ab00,color:#000
+    classDef priv fill:#e6f4ea,stroke:#34a853,color:#000
+    classDef plat fill:#e8f0fe,stroke:#4285f4,color:#000
+    class EXT,DEV pub
+    class VLAN,BAS,VIP priv
+    class CS,GW,API plat
+```
+
+*API Endpoint Topology — public and private paths to the same control plane*
+
+### 8.1. Public endpoint
+
+The cluster's API server is published through a TLS-passthrough gateway on a platform hostname. TLS terminates at the customer's own API server, not at the gateway — the platform forwards the encrypted stream without the ability to inspect it. The public endpoint is a **toggle**: it can be enabled for initial setup and disabled once private access is established, or left on permanently for teams operating from anywhere.
+
+### 8.2. Private endpoint
+
+For clusters attached to a customer VLAN, the API server is additionally reachable on a VIP advertised on that VLAN. Traffic from the customer's own VMs and bastion hosts reaches the control plane without traversing the public internet at all. Customers who require it can run with the public endpoint switched **off** entirely, leaving the private VIP as the only path.
+
+### 8.3. Break-glass access
+
+Running with a private-only endpoint introduces a dependency: if the customer's VLAN or bastion becomes unavailable, they lose the ability to reach their own cluster to diagnose the problem. The platform therefore offers an **opt-in break-glass public route** — the same TLS-passthrough gateway path, enabled on demand, with a separate downloadable kubeconfig. The private VIP remains the primary path and is unchanged; break-glass is purely additive and can be switched off again once normal access is restored.
+
+### 8.4. Credentials
+
+Cluster access is delivered as a standard `kubeconfig`, downloadable from the WebApp in admin and private-endpoint variants. Inside the cluster, authorization is ordinary Kubernetes RBAC — customers create their own Roles, ClusterRoles and bindings, integrate with their own identity provider if desired, and the platform does not interpose on cluster-internal authorization decisions.
+
+> **📷 Screenshot placeholder — `img/mk8s-09-endpoints-kubeconfig.png`**
+> *Capture: the endpoint controls — public endpoint toggle, private VIP display, and the kubeconfig download buttons.*
+
+---
+
+## 9. Security
+
+Security in the managed Kubernetes service is layered: encryption of cluster state at rest, strict multi-tenant isolation of key material, controlled and audited operator access, and the customer's own in-cluster controls.
+
+### 9.1. Encryption at rest
+
+Customers can enable **etcd encryption-at-rest** per cluster with a single toggle. Once enabled, every Secret — and optionally other resource types — is sealed before it is written to disk, using a three-layer key hierarchy:
+
+```mermaid
+flowchart TB
+    P["Plaintext Secret<br/><i>exists only in apiserver memory<br/>and pod tmpfs</i>"]
+    D["Data Encryption Key (DEK)<br/>256-bit, generated per row, used once"]
+    K["Key Encryption Key (KEK)<br/>per-cluster, AES-256-GCM<br/><b>never leaves OpenBao in plaintext</b>"]
+    R["OpenBao root / unseal key<br/>multi-key unseal, held by platform"]
+
+    P -->|"AES-256-GCM seal"| D
+    D -->|"Transit wrap via KMS v2 plugin"| K
+    K -->|"sealed at rest by"| R
+
+    classDef l fill:#e8f0fe,stroke:#4285f4,color:#000
+    class P,D,K,R l
+```
+
+*Encryption-at-Rest Key Hierarchy*
+
+The control plane runs a **KMS v2 plugin** sidecar alongside the API server. The API server asks the sidecar to wrap or unwrap data encryption keys; the sidecar forwards to OpenBao Transit, which performs the cryptography internally. **The key encryption key never leaves OpenBao in plaintext**, and the sidecar authenticates using a projected Kubernetes ServiceAccount token validated by OpenBao — no static credentials exist on disk.
+
+The guarantee this delivers: anyone obtaining a bit-for-bit copy of the etcd database file or a backup archive, without also holding OpenBao access, sees ciphertext only.
+
+### 9.2. Key isolation between tenants
+
+Key material is isolated at three levels: an OpenBao **namespace per organization** — a kernel-level barrier where cross-namespace reads return not-found — a **mount per project** inside that namespace, and a **Transit key per cluster** inside that mount. Key isolation is enforced by the key store itself, not by application-level filtering.
+
+### 9.3. Key rotation
+
+Customers can opt into **scheduled key-encryption-key rotation** on a chosen interval. Rotation generates a new key version; subsequent writes use it while earlier versions remain available for decryption until re-wrapping completes. Rotation state — current version, last rotation, next scheduled rotation, minimum decryption version — is reported on the cluster status so customers can evidence their rotation posture for audit.
+
+The complete threat model, including an explicit table of what encryption-at-rest does and does not protect against, is in [encryption-at-rest-design.md](encryption-at-rest-design.md).
+
+### 9.4. Operator access controls
+
+Customers requiring assurance about CloudSigma-side access have a documented, auditable model:
+
+- **A single bastion host** is the only network entry to the management platform; control-plane nodes have no public IPs and SSH is public-key-only.
+- **A GitOps repository is the only configuration-change path.** No operator runs ad-hoc changes against the platform; every change is a reviewed commit with signed history.
+- **Secrets in that repository are encrypted at rest** with a committed, auditable list of authorized decryption keys.
+- **Two access tiers:** day-to-day access via SSO with a per-engineer identity recorded in every audit entry, and a break-glass path that is rotated after every use, with the rotation itself recorded as a commit.
+
+Full detail is in [operator-access-controls.md](operator-access-controls.md).
+
+### 9.5. Customer-side controls
+
+Inside the cluster, the customer holds the standard Kubernetes security surface unmodified: RBAC, ServiceAccounts, `NetworkPolicy` and `CiliumNetworkPolicy`, Pod Security Standards, admission webhooks, and any third-party policy engine or scanner they choose to install.
+
+### 9.6. Vulnerability response
+
+Platform components, node images and add-ons are patched on a managed cadence. Security issues that require coordinated action are documented with customer-facing analysis, exposure assessment and mitigation guidance — see [cve-2026-43284-dirty-frag-mitigation.md](cve-2026-43284-dirty-frag-mitigation.md) for a worked example of the process.
+
+---
+
+## 10. Backup & Recovery
+
+### 10.1. Control-plane state
+
+Each cluster's etcd can be snapshotted on a **configurable schedule** to object storage, with **configurable retention**. Backups protect against catastrophic loss of the control plane's persistent state — the scenario that would otherwise mean total cluster loss.
+
+```mermaid
+flowchart LR
+    E[("etcd datastore")] -->|"scheduled snapshot"| J["Backup job"]
+    J -->|"encrypted with<br/>cluster KEK"| S[("Object storage bucket<br/><i>per project</i>")]
+    S -->|"retention policy"| X["Expired snapshots removed"]
+    S -.->|"restore on request"| E
+
+    classDef n fill:#e8f0fe,stroke:#4285f4,color:#000
+    class E,J,S,X n
+```
+
+*etcd Backup Pipeline*
+
+- **Schedule and retention** are customer-configurable per cluster.
+- **Backups inherit encryption.** For clusters with encryption-at-rest enabled, the snapshot is wrapped by the same customer-scoped key — a stolen backup archive is ciphertext.
+- **Backup status is reported on the cluster**, including the timestamp and identifier of the most recent successful snapshot, so a failing backup is visible rather than silent.
+- **Restore** is performed by CloudSigma on request from a selected snapshot.
+
+### 10.2. Workload state
+
+Control-plane snapshots cover Kubernetes object state, not the contents of PersistentVolumes. Customers running stateful workloads should additionally use a workload-level backup tool — Velero and application-native backup operators both run normally on the platform — or the block-storage backup capability described in section 8.2 of the parent *Platform Capabilities* document.
+
+### 10.3. High availability
+
+The control plane runs with multiple replicas and automatic failover; etcd runs highly available and can be **dedicated per cluster** for customers who require physical separation of their control-plane state from other tenants, or **shared** for cost efficiency. Worker-node failure is handled by ordinary Kubernetes rescheduling, and pool rollouts respect PodDisruptionBudgets so availability constraints declared by the customer are honoured during every platform-initiated node replacement.
+
+> **📷 Screenshot placeholder — `img/mk8s-10-backup-config.png`**
+> *Capture: the backup configuration panel — enable toggle, schedule, retention, and the latest successful backup timestamp.*
+
+---
+
+## 11. Monitoring & Observability
+
+Each cluster exposes the standard Kubernetes observability surface, and the platform monitors the components it operates.
+
+- **Resource metrics** are available in-cluster, powering `kubectl top`, HorizontalPodAutoscaler and VerticalPodAutoscaler for customer workloads.
+- **Cluster and pool status** — phase, ready/updated/deleting replica counts, per-pool observed version, control-plane readiness, backup and encryption state — is reported continuously and visible in the WebApp.
+- **Kubernetes events** for every lifecycle operation (provisioning, scaling, upgrades, failures) are surfaced in the WebApp and available through `kubectl` for the customer's own tooling.
+- **Customer-owned observability stacks** — Prometheus, Grafana, Loki, OpenTelemetry collectors, or any commercial agent — install and run normally. The platform imposes no restriction on what a customer deploys to observe their own cluster.
+- **Platform-side monitoring** — CloudSigma monitors control-plane health, etcd, backups and add-on reconciliation across every managed cluster, and acts on alerts without waiting for a customer report.
+
+> **📷 Screenshot placeholder — `img/mk8s-11-events-tab.png`**
+> *Capture: the cluster Events tab during a worker-pool scale or upgrade, showing the lifecycle event stream.*
+
+---
+
+## 12. Interoperability & Portability
+
+The service is deliberately built to avoid lock-in, consistent with CloudSigma's platform-wide position:
+
+- **Upstream Kubernetes, unmodified.** No forked API server, no proprietary resource types a workload must adopt.
+- **Standard tooling** — `kubectl`, Helm, Kustomize, Argo CD, Flux, Terraform and CI systems all work without platform-specific plugins.
+- **Portable manifests.** Workload definitions carry no CloudSigma-specific fields. The only platform-aware objects are the StorageClass name and `type=LoadBalancer` Services, both of which are standard Kubernetes constructs with equivalents on any other provider.
+- **Open-source add-ons** — Cilium, CoreDNS, MetalLB, Kamaji, Cluster API, OpenBao — all replaceable knowledge, all publicly documented.
+- **Full API coverage.** Every operation available in the WebApp is available declaratively, so cluster fleets can be managed as code.
+
+---
+
+## 13. Service Support & SLA
+
+Managed Kubernetes is covered by the CloudSigma support channels and service levels described in sections 15 and 16 of the parent *Platform Capabilities* document: 24/7 live support via chat, email, phone and ticketing, with a response-time guarantee of under one hour across all channels and typically immediate response on live chat.
+
+Support scope specific to this service:
+
+| Area | Handled by |
+|---|---|
+| Control-plane availability, performance and upgrades | CloudSigma |
+| etcd health, backups and restores | CloudSigma |
+| Platform add-on faults and updates | CloudSigma |
+| Worker node provisioning failures | CloudSigma |
+| Encryption key material and rotation | CloudSigma |
+| Customer workload faults, scheduling and configuration | Customer, with CloudSigma advisory support |
+| Cluster capacity planning | Customer, with CloudSigma advisory support |
+
+Configuration changes that are not yet exposed as a WebApp control — non-default rollout strategies, drain timeouts, kubelet reservation overrides, raised autoscaling bounds — are applied by CloudSigma on request through a support ticket.
+
+---
+
+## 14. Roadmap
+
+The following capabilities are in active development. Items are listed because they affect architectural planning; availability dates are confirmed through the account team.
+
+- **Worker pool autoscaling** — min/max node counts per pool with automatic scale-out on unschedulable pods and scale-in on sustained underutilisation.
+- **Self-service restore** — customer-initiated restore from a chosen etcd snapshot in the WebApp.
+- **Customer-supplied object storage for backups** — targeting a customer-owned external bucket.
+- **Expanded WebApp coverage** for controls currently applied by support request: rollout strategy, drain timeout, kubelet reservations.
+- **Additional infrastructure providers** for hybrid and multi-cloud worker pools.
+
+---
+
+## Related documentation
+
+| Document | Covers |
+|---|---|
+| [cluster-addons.md](cluster-addons.md) | Per-add-on reference — what is configurable, what is reconciled, common operations |
+| [cluster-upgrades.md](cluster-upgrades.md) | Upgrade best practices for production and large clusters |
+| [encryption-at-rest-design.md](encryption-at-rest-design.md) | Full key hierarchy, threat model and isolation design |
+| [operator-access-controls.md](operator-access-controls.md) | How CloudSigma operators access the platform, and how it is audited |
+| [cve-2026-43284-dirty-frag-mitigation.md](cve-2026-43284-dirty-frag-mitigation.md) | Worked example of the vulnerability-response process |
+
+---
+
+## Screenshot index
+
+All screenshots referenced above should be captured from the CloudSigma marketplace WebApp and placed in `docs/img/`.
+
+| File | Screen | What to show |
+|---|---|---|
+| `mk8s-01-cluster-list.png` | Cluster list | Several clusters, mixed phases, version / endpoint / node-count columns |
+| `mk8s-02-create-wizard.png` | Create Cluster | Name, version, location, first pool sizing |
+| `mk8s-03-cluster-summary.png` | Summary tab | Ready cluster — phase, version, endpoint, control-plane and pool rollup |
+| `mk8s-04-worker-pools.png` | Workers tab | Two differently shaped pools, Pause / Scale controls |
+| `mk8s-05-upgrade-wizard.png` | Upgrade wizard | Target version, pre-flight checks, control-plane-only mode |
+| `mk8s-06-autoscaling-status.png` | Control-plane sizing | Active autoscaling mode and per-container recommendations |
+| `mk8s-07-storage.png` | Storage | Bound PVC on `cloudsigma-dssd`, StorageClass list |
+| `mk8s-08-network-tab.png` | Network tab | CIDRs, endpoint config, VLAN attachment, LoadBalancer IPs |
+| `mk8s-09-endpoints-kubeconfig.png` | Endpoints | Public toggle, private VIP, kubeconfig downloads |
+| `mk8s-10-backup-config.png` | Backup config | Enable toggle, schedule, retention, last successful backup |
+| `mk8s-11-events-tab.png` | Events tab | Lifecycle event stream during a scale or upgrade |
