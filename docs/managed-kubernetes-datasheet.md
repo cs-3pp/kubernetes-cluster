@@ -112,8 +112,9 @@ Worker nodes are CloudSigma KVM virtual machines in the customer's own account, 
 | Kubelet tuning | CloudSigma applies | `maxPods`, reserved resources, eviction thresholds |
 | Namespaces, workloads, PVCs, Services, RBAC, NetworkPolicy | **Customer** | Full — never modified by CloudSigma |
 
-> **📷 Screenshot placeholder — `img/mk8s-01-cluster-list.png`**
-> *Capture: the Kubernetes cluster list in the CloudSigma marketplace WebApp, showing several clusters with their phase (Ready / Provisioning), Kubernetes version, endpoint and worker-node count.*
+![Kubernetes cluster list in the marketplace WebApp](img/mk8s-01-cluster-list.png)
+
+*The cluster list — each cluster with its phase (Ready / Provisioning), Kubernetes version, node count, and a one-click upgrade action when a newer version is available*
 
 ---
 
@@ -173,11 +174,13 @@ All lifecycle operations are available after creation without recreating the clu
 - **Enable or disable scheduled backups** and change schedule or retention.
 - **Enable encryption-at-rest** and opt into scheduled key rotation.
 
-> **📷 Screenshot placeholder — `img/mk8s-02-create-wizard.png`**
-> *Capture: the Create Cluster wizard — name, Kubernetes version, location, and the first worker pool sizing controls (CPU, RAM, disk, node count).*
+![Create Kubernetes Cluster wizard](img/mk8s-02-create-wizard.png)
 
-> **📷 Screenshot placeholder — `img/mk8s-03-cluster-summary.png`**
-> *Capture: the cluster Summary tab of a Ready cluster — phase, version, API endpoint, control-plane status and worker-pool rollup.*
+*Cluster creation — name and Kubernetes version, cluster labels, the Public vs. Private VLAN network choice, the etcd encryption-at-rest opt-in (immutable after creation), and optional kubelet tuning*
+
+![Cluster summary of a Ready cluster](img/mk8s-03-cluster-summary.png)
+
+*A Ready cluster — control-plane replicas, API endpoint, version and age on the left; the infrastructure panel shows the dedicated etcd DataStore, network exposure, worker-pool rollup and encryption state, with kubeconfig download one click away*
 
 ---
 
@@ -219,8 +222,9 @@ Any operation that replaces nodes — an upgrade, an image change, a pool reconf
 
 The `maxSurge=1, maxUnavailable=0` default is the safest possible setting: capacity never dips below the declared pool size. It is also the slowest, which is the correct trade-off for production clusters.
 
-> **📷 Screenshot placeholder — `img/mk8s-04-worker-pools.png`**
-> *Capture: the Workers tab showing two pools with differing shapes, their node counts, versions, phase, and the per-pool Pause / Scale controls.*
+![Worker pools table](img/mk8s-04-worker-pools.png)
+
+*Two pools with different shapes (2 cores/4 Gi and 3 cores/3 Gi) on the same cluster — per-pool version, VLAN, phase, and the Scale / Pause / Delete controls described in §3.3*
 
 ---
 
@@ -262,8 +266,9 @@ Platform add-ons are upgraded out-of-band by CloudSigma on their own cadence, in
 
 Full operational guidance, including recommendations for clusters with 20+ nodes and pods in the 50–100 GB range, is in [cluster-upgrades.md](cluster-upgrades.md).
 
-> **📷 Screenshot placeholder — `img/mk8s-05-upgrade-wizard.png`**
-> *Capture: the upgrade wizard — target version selection, pre-flight checks, and the control-plane-only vs. full-cluster mode choice.*
+![Upgrade wizard, step 1](img/mk8s-05-upgrade-wizard.png)
+
+*The staged upgrade choice from §4 in the product: control-plane-only (recommended) leaves worker pools running on the previous version to upgrade later on your schedule; the cascade option documents its rolling, surge-1, drain-first behaviour up front*
 
 ---
 
@@ -595,18 +600,18 @@ The following capabilities are in active development. Items are listed because t
 
 ## Screenshot index
 
-All screenshots referenced above should be captured from the CloudSigma marketplace WebApp and placed in `docs/img/`.
+Screenshots live in `docs/img/`, captured from the CloudSigma marketplace WebApp.
 
-| File | Screen | What to show |
+| File | Screen | Status |
 |---|---|---|
-| `mk8s-01-cluster-list.png` | Cluster list | Several clusters, mixed phases, version / endpoint / node-count columns |
-| `mk8s-02-create-wizard.png` | Create Cluster | Name, version, location, first pool sizing |
-| `mk8s-03-cluster-summary.png` | Summary tab | Ready cluster — phase, version, endpoint, control-plane and pool rollup |
-| `mk8s-04-worker-pools.png` | Workers tab | Two differently shaped pools, Pause / Scale controls |
-| `mk8s-05-upgrade-wizard.png` | Upgrade wizard | Target version, pre-flight checks, control-plane-only mode |
-| `mk8s-06-autoscaling-status.png` | Control-plane sizing | Active autoscaling mode and per-container recommendations |
-| `mk8s-07-storage.png` | Storage | Bound PVC on `cloudsigma-dssd`, StorageClass list |
-| `mk8s-08-network-tab.png` | Network tab | CIDRs, endpoint config, VLAN attachment, LoadBalancer IPs |
-| `mk8s-09-endpoints-kubeconfig.png` | Endpoints | Public toggle, private VIP, kubeconfig downloads |
-| `mk8s-10-backup-config.png` | Backup config | Enable toggle, schedule, retention, last successful backup |
-| `mk8s-11-events-tab.png` | Events tab | Lifecycle event stream during a scale or upgrade |
+| `mk8s-01-cluster-list.png` | Cluster list | ✅ Captured |
+| `mk8s-02-create-wizard.png` | Create Cluster | ✅ Captured |
+| `mk8s-03-cluster-summary.png` | Summary tab | ✅ Captured |
+| `mk8s-04-worker-pools.png` | Workers tab | ✅ Captured |
+| `mk8s-05-upgrade-wizard.png` | Upgrade wizard | ✅ Captured |
+| `mk8s-06-autoscaling-status.png` | Control-plane sizing — active autoscaling mode and per-container recommendations | 📷 Pending |
+| `mk8s-07-storage.png` | Storage — bound PVC on `cloudsigma-dssd`, StorageClass list | 📷 Pending |
+| `mk8s-08-network-tab.png` | Network tab — CIDRs, endpoint config, VLAN attachment, LoadBalancer IPs | 📷 Pending |
+| `mk8s-09-endpoints-kubeconfig.png` | Endpoints — public toggle, private VIP, kubeconfig downloads | 📷 Pending |
+| `mk8s-10-backup-config.png` | Backup config — enable toggle, schedule, retention, last successful backup | 📷 Pending |
+| `mk8s-11-events-tab.png` | Events tab — lifecycle event stream during a scale or upgrade | 📷 Pending |
