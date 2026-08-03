@@ -304,16 +304,20 @@ flowchart LR
 
 *Control-Plane Vertical Autoscaling Loop*
 
-### 5.2. Worker pool autoscaling — coming soon
+### 5.2. Worker pool autoscaling
 
-Horizontal autoscaling of worker pools is on the near-term roadmap. Once available, a pool will be given a minimum and maximum node count, and the platform will add nodes when pods are unschedulable for lack of capacity and remove nodes that have been underutilised and drainable for a sustained period — the standard Cluster Autoscaler contract, integrated with the CloudSigma provisioning API.
+Each worker pool can be switched from manual scaling to autoscaling directly on its row in the WebApp. Autoscaling is configured per pool with a **minimum and maximum node count** and operates in two directions, each enabled independently:
 
-Until it ships, worker capacity is changed by scaling a pool from the WebApp or through automation against the cluster API. Pool scaling is already a live, non-disruptive operation, so adopting autoscaling later will not require any change to cluster or workload configuration.
+- **Adding nodes.** Nodes are added when pods are unschedulable for lack of capacity — the standard Cluster Autoscaler contract, integrated with the CloudSigma provisioning API. Optionally, a measured-load floor can also be set: when pool CPU or memory usage stays above a chosen percentage for a chosen period, the pool grows even before pods start pending.
+- **Removing idle nodes.** Opt-in scale-down: a node whose requests stay below a chosen percentage for a sustained period (10 minutes by default) is drained — respecting PodDisruptionBudgets — and removed, never going below the pool minimum.
 
-**Workload autoscaling inside the cluster is available today and unaffected by the above.** `HorizontalPodAutoscaler` and `VerticalPodAutoscaler` for customer workloads work exactly as upstream, driven by the metrics pipeline running in every cluster.
+Thresholds and periods have sensible defaults and are tunable per pool. Load-based scaling uses the metrics pipeline that ships with every cluster. Pools with autoscaling enabled show *"Platform manages replicas"* — manual scale input is disabled while the platform owns the count, and autoscaling can be paused or disabled per pool at any time.
 
-> **📷 Screenshot placeholder — `img/mk8s-06-autoscaling-status.png`**
-> *Capture: the control-plane sizing/recommendation panel showing the active autoscaling mode and current per-container recommendations.*
+![Worker pool autoscaling controls](img/mk8s-06-autoscaling-status.png)
+
+*Per-pool autoscaling in the WebApp: mode selection, min/max bounds, the optional load thresholds for adding nodes, and the opt-in idle-node removal with its own threshold and period*
+
+**Workload autoscaling inside the cluster** is independent of pool autoscaling: `HorizontalPodAutoscaler` and `VerticalPodAutoscaler` for customer workloads work exactly as upstream, driven by the same metrics pipeline. The two compose — HPA adds pods, and when those pods no longer fit, pool autoscaling adds nodes.
 
 ---
 
@@ -330,8 +334,24 @@ Because the underlying storage replicates three copies across separate servers, 
 
 **Object storage** for workloads that need it (artifacts, backups, media) is available from the CloudSigma object storage service and consumed from a cluster with any S3-compatible client or operator.
 
-> **📷 Screenshot placeholder — `img/mk8s-07-storage.png`**
-> *Capture: `kubectl get pvc,pv,storageclass` output in a cluster with a bound PVC on `cloudsigma-dssd`, or the equivalent WebApp storage view.*
+**In practice** — a 5 Gi claim on a live cluster (`tsap-test`, zrh region), from claim to mounted filesystem. The default StorageClass binds on first consumer, the CSI driver provisions and attaches the DSSD volume, and the pod sees an ordinary block device:
+
+```console
+$ kubectl get storageclass
+NAME                        PROVISIONER          RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+cloudsigma-dssd (default)   csi.cloudsigma.com   Delete          WaitForFirstConsumer   true                   26d
+
+$ kubectl get pvc,pv
+NAME                                STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS
+persistentvolumeclaim/web-content   Bound    pvc-0559d867-e213-4c8a-99bb-686b8590b123   5Gi        RWO            cloudsigma-dssd
+
+NAME                                                        CAPACITY   RECLAIM POLICY   STATUS   CLAIM                 STORAGECLASS
+persistentvolume/pvc-0559d867-e213-4c8a-99bb-686b8590b123   5Gi        Delete           Bound    default/web-content   cloudsigma-dssd
+
+$ kubectl exec deploy/web -- df -h /usr/share/nginx/html
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdb        4.9G   24K  4.6G   1% /usr/share/nginx/html
+```
 
 ---
 
@@ -373,8 +393,39 @@ A **kube-api-proxy** component runs in every cluster so that `kubernetes.default
 
 Add-ons are continuously reconciled against a tested baseline, which keeps every cluster identical and predictable. Full per-add-on detail — what is configurable, what is reverted, and the common operations for each — is in [cluster-addons.md](cluster-addons.md).
 
-> **📷 Screenshot placeholder — `img/mk8s-08-network-tab.png`**
-> *Capture: the cluster Network tab — pod/service CIDRs, API endpoint configuration, VLAN attachment and LoadBalancer IP allocations.*
+**In practice** — the two LoadBalancer models on live clusters in the zrh region. On a **public cluster**, a plain unannotated `type=LoadBalancer` Service gets a CloudSigma static IP attached, tagged and routed by the CCM within seconds:
+
+```console
+$ kubectl get svc web
+NAME   TYPE           CLUSTER-IP       EXTERNAL-IP    PORT(S)        AGE
+web    LoadBalancer   10.102.192.168   178.22.67.48   80:31328/TCP   17s
+```
+
+```text
+# CloudSigma CCM (control-plane log)
+Discovered 1 static IPs and 11 dynamic IPs
+Tagged IP 178.22.67.48 with cluster=test-old, service=default/web
+```
+
+On a **private-link cluster**, worker nodes have no public NIC at all; the CCM detects this and defers LoadBalancer VIPs to MetalLB on the customer's own VLAN:
+
+```text
+# CloudSigma CCM (control-plane log)
+Server 9efc3888-… has no public NIC — treating as private-link / VLAN-only worker;
+skipping CCM LoadBalancer IP management for this node (MetalLB manages LB IPs on customer VLAN)
+```
+
+The private backplane is visible from inside any cluster — worker nodes live on the cloud VLAN, and `kubernetes.default` resolves through the transparent kube-api-proxy:
+
+```console
+$ kubectl get nodes -o wide
+NAME                                   STATUS   ROLES    AGE   VERSION   INTERNAL-IP     EXTERNAL-IP
+9efc3888-1c01-4a7c-9d2c-4a21b8fb7fb0   Ready    <none>   23d   v1.36.2   100.64.128.16   <none>
+
+$ kubectl get svc -n kube-system kube-api-proxy
+NAME             TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)    AGE
+kube-api-proxy   ClusterIP   10.107.108.151   <none>        6443/TCP   26d
+```
 
 ---
 
@@ -425,8 +476,9 @@ Running with a private-only endpoint introduces a dependency: if the customer's 
 
 Cluster access is delivered as a standard `kubeconfig`, downloadable from the WebApp in admin and private-endpoint variants. Inside the cluster, authorization is ordinary Kubernetes RBAC — customers create their own Roles, ClusterRoles and bindings, integrate with their own identity provider if desired, and the platform does not interpose on cluster-internal authorization decisions.
 
-> **📷 Screenshot placeholder — `img/mk8s-09-endpoints-kubeconfig.png`**
-> *Capture: the endpoint controls — public endpoint toggle, private VIP display, and the kubeconfig download buttons.*
+![Public API access panel with break-glass controls](img/mk8s-09-endpoints-kubeconfig.png)
+
+*The break-glass panel on a private-link cluster: the public endpoint hostname, a one-click external kubeconfig download, the disable switch — and the reminder that RBAC still applies on the public path*
 
 ---
 
@@ -501,7 +553,7 @@ flowchart LR
     E[("etcd datastore")] -->|"scheduled snapshot"| J["Backup job"]
     J -->|"encrypted with<br/>cluster KEK"| S[("Object storage bucket<br/><i>per project</i>")]
     S -->|"retention policy"| X["Expired snapshots removed"]
-    S -.->|"restore on request"| E
+    S -.->|"self-service restore"| E
 
     classDef n fill:#e8f0fe,stroke:#4285f4,color:#000
     class E,J,S,X n
@@ -510,9 +562,11 @@ flowchart LR
 *etcd Backup Pipeline*
 
 - **Schedule and retention** are customer-configurable per cluster.
-- **Backups inherit encryption.** For clusters with encryption-at-rest enabled, the snapshot is wrapped by the same customer-scoped key — a stolen backup archive is ciphertext.
+- **Backups inherit encryption.** For clusters with encryption-at-rest enabled, the snapshot is wrapped by the same customer-scoped key — a stolen backup archive is ciphertext. Encrypted snapshots are labelled as such in the snapshot picker.
 - **Backup status is reported on the cluster**, including the timestamp and identifier of the most recent successful snapshot, so a failing backup is visible rather than silent.
-- **Restore** is performed by CloudSigma on request from a selected snapshot.
+- **On-demand snapshots.** *Take snapshot now* runs a one-off job with the same configuration as the daily backup, with the cluster staying online.
+- **Self-service restore.** The customer picks any retained snapshot in the WebApp and restores the control plane to it. The tenant API is unreachable for roughly 60–120 seconds during the restore; workload pods on worker nodes keep running throughout. Control-plane state created after the snapshot is lost — the WebApp states this before the action is confirmed.
+- **Deleting a cluster retains its snapshots** in the backup bucket, so an accidental deletion is not a data-loss event for control-plane state.
 
 ### 10.2. Workload state
 
@@ -522,8 +576,9 @@ Control-plane snapshots cover Kubernetes object state, not the contents of Persi
 
 The control plane runs with multiple replicas and automatic failover; etcd runs highly available and can be **dedicated per cluster** for customers who require physical separation of their control-plane state from other tenants, or **shared** for cost efficiency. Worker-node failure is handled by ordinary Kubernetes rescheduling, and pool rollouts respect PodDisruptionBudgets so availability constraints declared by the customer are honoured during every platform-initiated node replacement.
 
-> **📷 Screenshot placeholder — `img/mk8s-10-backup-config.png`**
-> *Capture: the backup configuration panel — enable toggle, schedule, retention, and the latest successful backup timestamp.*
+![Restore from backup in the Danger Zone](img/mk8s-10-backup-config.png)
+
+*Self-service recovery: the snapshot picker (showing an encrypted daily snapshot with size and timestamp), on-demand snapshot, and restore — with the impact stated in the UI before anything runs*
 
 ---
 
@@ -534,11 +589,13 @@ Each cluster exposes the standard Kubernetes observability surface, and the plat
 - **Resource metrics** are available in-cluster, powering `kubectl top`, HorizontalPodAutoscaler and VerticalPodAutoscaler for customer workloads.
 - **Cluster and pool status** — phase, ready/updated/deleting replica counts, per-pool observed version, control-plane readiness, backup and encryption state — is reported continuously and visible in the WebApp.
 - **Kubernetes events** for every lifecycle operation (provisioning, scaling, upgrades, failures) are surfaced in the WebApp and available through `kubectl` for the customer's own tooling.
+- **Control-plane logs** for the customer's own cluster — kube-apiserver, etcd, the KMS plugin and the cloud controller manager — are browsable in Grafana with per-component filtering, error counts and full log lines, even though those components run outside the cluster in the hosted control plane.
 - **Customer-owned observability stacks** — Prometheus, Grafana, Loki, OpenTelemetry collectors, or any commercial agent — install and run normally. The platform imposes no restriction on what a customer deploys to observe their own cluster.
 - **Platform-side monitoring** — CloudSigma monitors control-plane health, etcd, backups and add-on reconciliation across every managed cluster, and acts on alerts without waiting for a customer report.
 
-> **📷 Screenshot placeholder — `img/mk8s-11-events-tab.png`**
-> *Capture: the cluster Events tab during a worker-pool scale or upgrade, showing the lifecycle event stream.*
+![Control-plane logs in Grafana](img/mk8s-logging-grafana.png)
+
+*The hosted control plane is not a black box: per-cluster log dashboards break down lines and errors by component — kube-apiserver, etcd, kms-plugin, cloudsigma-ccm — with the raw log stream below*
 
 ---
 
@@ -578,8 +635,6 @@ Configuration changes that are not yet exposed as a WebApp control — non-defau
 
 The following capabilities are in active development. Items are listed because they affect architectural planning; availability dates are confirmed through the account team.
 
-- **Worker pool autoscaling** — min/max node counts per pool with automatic scale-out on unschedulable pods and scale-in on sustained underutilisation.
-- **Self-service restore** — customer-initiated restore from a chosen etcd snapshot in the WebApp.
 - **Customer-supplied object storage for backups** — targeting a customer-owned external bucket.
 - **Expanded WebApp coverage** for controls currently applied by support request: rollout strategy, drain timeout, kubelet reservations.
 - **Additional infrastructure providers** for hybrid and multi-cloud worker pools.
@@ -609,9 +664,10 @@ Screenshots live in `docs/img/`, captured from the CloudSigma marketplace WebApp
 | `mk8s-03-cluster-summary.png` | Summary tab | ✅ Captured |
 | `mk8s-04-worker-pools.png` | Workers tab | ✅ Captured |
 | `mk8s-05-upgrade-wizard.png` | Upgrade wizard | ✅ Captured |
-| `mk8s-06-autoscaling-status.png` | Control-plane sizing — active autoscaling mode and per-container recommendations | 📷 Pending |
-| `mk8s-07-storage.png` | Storage — bound PVC on `cloudsigma-dssd`, StorageClass list | 📷 Pending |
-| `mk8s-08-network-tab.png` | Network tab — CIDRs, endpoint config, VLAN attachment, LoadBalancer IPs | 📷 Pending |
-| `mk8s-09-endpoints-kubeconfig.png` | Endpoints — public toggle, private VIP, kubeconfig downloads | 📷 Pending |
-| `mk8s-10-backup-config.png` | Backup config — enable toggle, schedule, retention, last successful backup | 📷 Pending |
-| `mk8s-11-events-tab.png` | Events tab — lifecycle event stream during a scale or upgrade | 📷 Pending |
+| `mk8s-06-autoscaling-status.png` | Worker pool autoscaling controls | ✅ Captured |
+| `mk8s-09-endpoints-kubeconfig.png` | Break-glass public API panel | ✅ Captured |
+| `mk8s-10-backup-config.png` | Snapshot picker + self-service restore | ✅ Captured |
+| `mk8s-logging-grafana.png` | Control-plane log dashboard (Grafana) | ✅ Captured |
+| ~~`mk8s-07-storage.png`~~ | Storage | Replaced by live `kubectl` console examples (§6) |
+| ~~`mk8s-08-network-tab.png`~~ | Networking | No such WebApp tab exists — replaced by live in-cluster console examples (§7.5) |
+| ~~`mk8s-11-events-tab.png`~~ | Events tab | Superseded by the Grafana control-plane log dashboard |
