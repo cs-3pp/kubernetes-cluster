@@ -306,16 +306,22 @@ flowchart LR
 
 ### 5.2. Worker pool autoscaling
 
-Each worker pool can be switched from manual scaling to autoscaling directly on its row in the WebApp. Autoscaling is configured per pool with a **minimum and maximum node count** and operates in two directions, each enabled independently:
+Each worker pool can be switched from manual scaling to autoscaling directly on its row in the WebApp, and configured with a **minimum and maximum node count**. A pool runs in one of two modes, and the choice determines what signal drives it:
 
-- **Adding nodes.** Nodes are added when pods are unschedulable for lack of capacity — the standard Cluster Autoscaler contract, integrated with the CloudSigma provisioning API. Optionally, a measured-load floor can also be set: when pool CPU or memory usage stays above a chosen percentage for a chosen period, the pool grows even before pods start pending.
-- **Removing idle nodes.** Opt-in scale-down: a node whose requests stay below a chosen percentage for a sustained period (10 minutes by default) is drained — respecting PodDisruptionBudgets — and removed, never going below the pool minimum.
+**Add nodes only.** The platform's own loop owns the node count and only ever grows the pool. It adds a node when pods are unschedulable for lack of capacity, and — optionally — when **measured CPU or memory usage** across the pool stays above a chosen percentage for a chosen period. This is the mode to pick when you want load-driven scaling: it reads live utilisation from the cluster's metrics pipeline. Nodes are never removed automatically.
 
-Thresholds and periods have sensible defaults and are tunable per pool. Load-based scaling uses the metrics pipeline that ships with every cluster. Pools with autoscaling enabled show *"Platform manages replicas"* — manual scale input is disabled while the platform owns the count, and autoscaling can be paused or disabled per pool at any time.
+**Add & remove nodes.** Upstream Cluster Autoscaler owns the node count, integrated with the CloudSigma provisioning API. It adds nodes when pods are unschedulable, and — opt-in — removes a node whose utilisation stays below a chosen percentage for a sustained period (50% over 10 minutes by default), draining it first and respecting PodDisruptionBudgets. It never goes below the pool minimum.
+
+Two details worth knowing when choosing:
+
+- **Only "Add nodes only" scales on usage.** Cluster Autoscaler adds capacity in response to pods that cannot be placed, not to a utilisation percentage — that is deliberate upstream design, not a platform limitation. A cluster whose pods request roughly what they use gets the same practical outcome from either mode.
+- **Removal is measured on requests, not live load.** A node counts as idle when the CPU and memory *reserved by its pods* fall below the threshold. A node sitting at 5% CPU whose pods reserve 80% of its capacity is not idle and will not be removed — which is what you want, since those reservations are promises the scheduler has already made.
+
+Thresholds and periods have sensible defaults and are tunable per pool. Pools with autoscaling enabled show *"Platform manages replicas"* — manual scale input is disabled while the platform owns the count, and autoscaling can be paused or disabled per pool at any time.
 
 ![Worker pool autoscaling controls](img/mk8s-06-autoscaling-status.png)
 
-*Per-pool autoscaling in the WebApp: mode selection, min/max bounds, the optional load thresholds for adding nodes, and the opt-in idle-node removal with its own threshold and period*
+*Per-pool autoscaling in the WebApp: mode selection, min/max bounds, the usage thresholds that add nodes under "Add nodes only", and the opt-in idle-node removal with its own threshold and period under "Add & remove nodes"*
 
 **Workload autoscaling inside the cluster** is independent of pool autoscaling: `HorizontalPodAutoscaler` and `VerticalPodAutoscaler` for customer workloads work exactly as upstream, driven by the same metrics pipeline. The two compose — HPA adds pods, and when those pods no longer fit, pool autoscaling adds nodes.
 
