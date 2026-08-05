@@ -1,6 +1,5 @@
 # Managed Kubernetes Service — Platform Capabilities
 
-**Document status:** Customer-facing capabilities datasheet
 **Applies to:** CloudSigma Managed Kubernetes, powered by Kube-DC
 **Companion to:** *CloudSigma Platform Capabilities* (sections 1–16)
 
@@ -8,7 +7,7 @@
 
 ## Introduction
 
-CloudSigma Managed Kubernetes delivers production-grade, CNCF-conformant Kubernetes clusters on the CloudSigma cloud without requiring customers to build, operate or upgrade a control plane. Customers provision a cluster from the CloudSigma marketplace WebApp in minutes, download a `kubeconfig`, and immediately use standard `kubectl`, Helm and any Kubernetes-native tooling against a cluster that behaves exactly like upstream Kubernetes — because it *is* upstream Kubernetes.
+CloudSigma Managed Kubernetes delivers production-grade Kubernetes clusters, built from unmodified upstream Kubernetes components, on the CloudSigma cloud — without requiring customers to build, operate or upgrade a control plane. Customers provision a cluster from the CloudSigma marketplace WebApp in minutes, download a `kubeconfig`, and immediately use standard `kubectl`, Helm and any Kubernetes-native tooling.
 
 The service is built on the same design philosophy as the wider CloudSigma platform: open standards, no proprietary burden, no vendor lock-in. Every cluster runs unmodified upstream Kubernetes with a curated set of open-source add-ons. Workloads, manifests and Helm charts move on and off the platform unchanged. There are no CloudSigma-specific API extensions a customer is obliged to adopt, and no re-architecting is required to run existing Kubernetes workloads.
 
@@ -25,8 +24,8 @@ The managed Kubernetes service is built on a **hosted control plane** model. Eac
 This split is the defining architectural decision of the service and it produces most of its operational advantages:
 
 - **No control-plane VMs on the customer's bill.** The customer pays for worker nodes and storage — the resources that actually run their workloads. There are no three master VMs sitting idle to fund.
-- **Control-plane high availability is automatic.** The control plane is a Kubernetes Deployment inside a highly available management cluster. Failover is pod rescheduling, measured in seconds, and requires no customer action.
-- **Control-plane upgrades are decoupled from worker upgrades.** A control-plane version bump is a rolling Deployment update that does not touch a single customer workload.
+- **Control-plane failover requires no customer action.** The control plane is a Kubernetes Deployment inside a highly available management cluster; failover is pod rescheduling, measured in seconds. Clusters configured with multiple control-plane and etcd replicas are highly available; a single-replica etcd configuration is not.
+- **Control-plane upgrades are decoupled from worker upgrades.** A control-plane version bump is a rolling Deployment update that replaces no worker nodes and evicts no workload pods.
 - **The blast radius of a worker-node failure is bounded.** Losing a worker node cannot damage the control plane or etcd, because they do not share a failure domain.
 
 ```mermaid
@@ -91,7 +90,7 @@ The management cluster hosts every customer cluster's control plane. It runs the
 
 Control-plane hosting uses **Kamaji**, an open-source hosted-control-plane engine, driving unmodified upstream Kubernetes component images. Worker-node provisioning uses **Cluster API (CAPI)** with the CloudSigma infrastructure provider, so node lifecycle follows the same declarative, reconciliation-driven model that the rest of the Kubernetes ecosystem uses.
 
-The management cluster is unreachable from customer clusters. It has no public entry point other than a single bastion host with public-key-only SSH, and every configuration change to it flows through a reviewed, cryptographically signed GitOps repository. This is documented in full in [operator-access-controls.md](operator-access-controls.md).
+The management cluster is unreachable from customer clusters. Its only *administrative* network entry is a single bastion host with public-key-only SSH, and administrative platform configuration flows through a reviewed, cryptographically signed GitOps repository. This is documented in full in [operator-access-controls.md](operator-access-controls.md).
 
 ### 1.2. The customer layer
 
@@ -172,7 +171,7 @@ All lifecycle operations are available after creation without recreating the clu
 - **Upgrade the control plane and each pool independently.**
 - **Toggle the public API endpoint** on or off.
 - **Enable or disable scheduled backups** and change schedule or retention.
-- **Enable encryption-at-rest** and opt into scheduled key rotation.
+- **Opt into scheduled key rotation** for clusters created with encryption-at-rest. (Encryption itself is selected at cluster creation and cannot be changed afterwards.)
 
 ![Create Kubernetes Cluster wizard](img/mk8s-02-create-wizard.png)
 
@@ -218,7 +217,7 @@ Any operation that replaces nodes — an upgrade, an image change, a pool reconf
 | `maxUnavailable` | 0 | No capacity reduction during rollout |
 | `nodeDrainTimeoutSeconds` | Operator-set | Upper bound on graceful drain before forced removal |
 | Pause | Off | Freeze a rollout mid-flight from the WebApp |
-| PodDisruptionBudget | Customer-defined | Respected during every voluntary eviction |
+| PodDisruptionBudget | Customer-defined | Honoured during drain until `nodeDrainTimeoutSeconds`; on timeout, forced removal may bypass a blocking PDB |
 
 The `maxSurge=1, maxUnavailable=0` default is the safest possible setting: capacity never dips below the declared pool size. It is also the slowest, which is the correct trade-off for production clusters.
 
@@ -230,7 +229,7 @@ The `maxSurge=1, maxUnavailable=0` default is the safest possible setting: capac
 
 ## 4. Cluster Upgrades
 
-Upgrades are **staged**: the control plane and each worker pool move independently, under customer control, with a pause button at every step. This is the mechanism that makes upgrading a large production cluster a controlled sequence of small, reversible decisions rather than one irreversible event.
+Upgrades are **staged**: the control plane and each worker pool move independently, under customer control, with customer-controlled checkpoints and per-pool pause controls. This turns upgrading a large production cluster into a sequence of small, observable steps rather than one big-bang event.
 
 ```mermaid
 flowchart TB
@@ -238,7 +237,7 @@ flowchart TB
     A1 -->|No| AX["Stop — workers untouched,<br/>workloads unaffected"]
     A1 -->|Yes| B["2 — Upgrade worker pool A<br/><i>maxSurge=1, maxUnavailable=0</i>"]
     B --> B1{"First node<br/>rolled cleanly?"}
-    B1 -->|No| BX["Pause pool from WebApp<br/>investigate, resume or roll back"]
+    B1 -->|No| BX["Pause pool from WebApp<br/>investigate, correct, resume"]
     B1 -->|Yes| C["3 — Complete pool A,<br/>then pools B, C… one at a time"]
     C --> D["Cluster fully upgraded"]
 
@@ -252,7 +251,7 @@ flowchart TB
 
 ### 4.1. Why the control plane goes first
 
-Kubernetes permits worker kubelets to lag the control plane by up to two minor versions, but never to exceed it. Upgrading the control plane first is therefore the only valid ordering, and it has a useful property: **it does not touch customer workloads at all**. The control plane rolls as pods in the management cluster; no customer node is drained, no customer pod is evicted. Customers can validate the new control plane against their live workloads before committing to any node replacement.
+Kubernetes permits worker kubelets to lag the control plane by up to three minor versions — and never to exceed it — so upgrading the control plane first is the only valid ordering. It also has a useful property: **no worker node is drained and no workload pod is evicted** while the control plane rolls in the management cluster. Customers should still validate API-dependent behaviour (admission webhooks, controllers) against the new control-plane version before rolling worker pools.
 
 ### 4.2. Worker pool upgrades
 
@@ -276,30 +275,24 @@ Full operational guidance, including recommendations for clusters with 20+ nodes
 
 ### 5.1. Control-plane and etcd vertical autoscaling — available
 
-When a cluster's control plane needs more resources, it gets them automatically: **both the control-plane pod and its etcd datastore are continuously right-sized by dedicated Vertical Pod Autoscalers**, one per layer. The recommenders observe actual CPU and memory consumption and produce target, lower-bound and upper-bound recommendations; the updaters apply them within per-container safety bounds. The active mode is visible on every cluster:
-
-```console
-$ kubectl get kdccluster
-NAME        VERSION   PHASE   ENDPOINT                                    DATASTORE        VPA
-tsap-test   v1.36.2   Ready   https://tsap-test-cp-….cloudsigma.com:443   tsap-test-etcd   InPlaceOrRecreate
-```
+When a cluster's control plane needs more resources, it gets them: **both the control-plane pod and its etcd datastore are right-sized by dedicated Vertical Pod Autoscalers**, one per layer. In the default mode the recommendations are applied automatically within per-container safety bounds; observation-only modes are available where the customer or CloudSigma prefers static sizing. The active autoscaling mode is part of each cluster's reported status.
 
 This directly addresses the failure mode that statically sized control planes suffer under: an API server or etcd whose memory limit was set for a small cluster gets OOM-killed once the cluster's object count, CRD surface or list-watch traffic grows — taking `kubectl` access, the controller manager and the scheduler down with it.
 
-**The control-plane autoscaler** covers every container in the hosted control plane — API server, controller manager, scheduler, konnectivity and the KMS plugin — with per-container floors and ceilings. The floors are deliberately non-trivial: they were raised from production incident analysis so that an idle control plane can never be shrunk to the point where probe deadlines start failing. The API-server ceiling (2 CPU / 6 Gi by default) is raised per cluster where a genuinely heavy tenant needs it. It never resizes below the configured replica count, and if an operator pins static resources on a cluster, the autoscaler steps back to recommendation-only rather than fight the override.
+**The control-plane autoscaler** covers every container in the hosted control plane — API server, controller manager, scheduler, konnectivity and the KMS plugin — with per-container floors and ceilings. The floors are deliberately non-trivial: they prevent a lightly loaded control plane from being shrunk below stable operating levels. The API-server ceiling (2 CPU / 6 Gi by default) is raised per cluster where a genuinely heavy tenant needs it. It never resizes below the configured replica count, and if an operator pins static resources on a cluster, the autoscaler steps back to recommendation-only rather than fight the override.
 
 **The etcd autoscaler** targets the cluster's etcd separately, with quorum as a hard invariant:
 
 - The updater is pinned to the etcd replica count, so a resize can **never evict below quorum** — a 3-replica etcd is resized one member at a time.
 - A **single-replica etcd is never evicted for a resize at all**: it runs in `Initial` mode, where the new size is applied at the next natural restart instead of by disruption.
-- Bounds default to 1 CPU / 4 Gi per member — sized from a real etcd OOM incident class — and are operator-adjustable per cluster.
+- Bounds default to 1 CPU / 4 Gi per member and are adjustable per cluster.
 
 Four modes are supported on either layer:
 
 - **`Off`** — recommendation-only. Sizing signals are computed and reported, nothing is changed.
 - **`Initial`** — recommendations are applied when a pod is created, never by eviction.
 - **`Recreate`** — pods are evicted to apply new sizes. Effective but disruptive.
-- **`InPlaceOrRecreate`** *(default)* — uses Kubernetes in-place pod resize where possible, falling back to eviction only when in-place resize is not applicable. **CPU resizing is restart-free.**
+- **`InPlaceOrRecreate`** *(default)* — uses Kubernetes in-place pod resize where possible, falling back to eviction only when in-place resize is not applicable. When an in-place CPU resize applies, the container is not restarted; the eviction fallback is disruptive.
 
 ```mermaid
 flowchart LR
@@ -308,7 +301,7 @@ flowchart LR
     R -->|"target / bounds"| S["Cluster status<br/><i>visible to customer</i>"]
     R --> U["VPA updater"]
     R2 --> U2["etcd VPA updater<br/><i>quorum-pinned</i>"]
-    U -->|"in-place resize<br/>(restart-free for CPU)"| M
+    U -->|"in-place resize<br/>(CPU without restart)"| M
     U -.->|"fallback: evict + recreate"| M
     U2 -->|"one member at a time,<br/>never below quorum"| E
     CAP["Per-container floors + ceilings<br/><i>protect shared capacity and probe deadlines</i>"] --> R
@@ -352,11 +345,11 @@ Persistent storage is delivered by the **CloudSigma CSI driver**, which provisio
 - **Dynamic provisioning** — volumes are created, attached and detached on demand as PVCs are created and pods are scheduled.
 - **Standard semantics** — `ReadWriteOnce` block volumes with the usual Kubernetes attach/detach and resize behaviour.
 
-Because the underlying storage replicates three copies across separate servers, a PersistentVolume survives drive, server and rack-level component failure without customer action and without data becoming even temporarily unavailable.
+The storage system maintains three replicas across separate servers and is designed to tolerate the component failures described in section 8 of the parent document without customer action. Availability characteristics follow the parent document and the applicable storage service levels.
 
 **Object storage** for workloads that need it (artifacts, backups, media) is available from the CloudSigma object storage service and consumed from a cluster with any S3-compatible client or operator.
 
-**In practice** — a 5 Gi claim on a live cluster (`tsap-test`, zrh region), from claim to mounted filesystem. The default StorageClass binds on first consumer, the CSI driver provisions and attaches the DSSD volume, and the pod sees an ordinary block device:
+**In practice** — a 5 Gi claim on a live cluster (`tsap-test`, zrh region), from claim to mounted filesystem. The default StorageClass binds on first consumer, the CSI driver provisions and attaches the DSSD volume, and the pod sees an ordinary block device (output abridged):
 
 ```console
 $ kubectl get storageclass
@@ -415,7 +408,7 @@ A **kube-api-proxy** component runs in every cluster so that `kubernetes.default
 
 Add-ons are continuously reconciled against a tested baseline, which keeps every cluster identical and predictable. Full per-add-on detail — what is configurable, what is reverted, and the common operations for each — is in [cluster-addons.md](cluster-addons.md).
 
-**In practice** — the two LoadBalancer models on live clusters in the zrh region. On a **public cluster**, a plain unannotated `type=LoadBalancer` Service gets a CloudSigma static IP attached, tagged and routed by the CCM within seconds:
+**In practice** — the two LoadBalancer models on live clusters in the zrh region (output abridged). On a **public cluster**, a plain unannotated `type=LoadBalancer` Service gets a CloudSigma static IP attached, tagged and routed by the CCM within seconds:
 
 ```console
 $ kubectl get svc web
@@ -484,7 +477,7 @@ flowchart LR
 
 ### 8.1. Public endpoint
 
-The cluster's API server is published through a TLS-passthrough gateway on a platform hostname. TLS terminates at the customer's own API server, not at the gateway — the platform forwards the encrypted stream without the ability to inspect it. The public endpoint is a **toggle**: it can be enabled for initial setup and disabled once private access is established, or left on permanently for teams operating from anywhere.
+The cluster's API server is published through a TLS-passthrough gateway on a platform hostname. The gateway does not terminate or decrypt the Kubernetes API TLS connection — it forwards the TLS stream to the cluster's own API server, where TLS terminates. The public endpoint is a **toggle**: it can be enabled for initial setup and disabled once private access is established, or left on permanently for teams operating from anywhere.
 
 ### 8.2. Private endpoint
 
@@ -510,14 +503,14 @@ Security in the managed Kubernetes service is layered: encryption of cluster sta
 
 ### 9.1. Encryption at rest
 
-Customers can enable **etcd encryption-at-rest** per cluster with a single toggle. Once enabled, every Secret — and optionally other resource types — is sealed before it is written to disk, using a three-layer key hierarchy:
+Customers can enable **etcd encryption-at-rest** when creating a cluster (the choice is immutable afterwards). Once enabled, every Secret — and optionally other configured resource types — is sealed before it is written to disk, using a three-layer key hierarchy:
 
 ```mermaid
 flowchart TB
     P["Plaintext Secret<br/><i>exists only in apiserver memory<br/>and pod tmpfs</i>"]
     D["Data Encryption Key (DEK)<br/>256-bit, generated per row, used once"]
     K["Key Encryption Key (KEK)<br/>per-cluster, AES-256-GCM<br/><b>never leaves OpenBao in plaintext</b>"]
-    R["OpenBao root / unseal key<br/>multi-key unseal, held by platform"]
+    R["OpenBao seal/barrier key material<br/>multi-key unseal, held by CloudSigma"]
 
     P -->|"AES-256-GCM seal"| D
     D -->|"Transit wrap via KMS v2 plugin"| K
@@ -531,11 +524,11 @@ flowchart TB
 
 The control plane runs a **KMS v2 plugin** sidecar alongside the API server. The API server asks the sidecar to wrap or unwrap data encryption keys; the sidecar forwards to OpenBao Transit, which performs the cryptography internally. **The key encryption key never leaves OpenBao in plaintext**, and the sidecar authenticates using a projected Kubernetes ServiceAccount token validated by OpenBao — no static credentials exist on disk.
 
-The guarantee this delivers: anyone obtaining a bit-for-bit copy of the etcd database file or a backup archive, without also holding OpenBao access, sees ciphertext only.
+What this delivers: an offline copy of the etcd database file or a backup archive does not reveal the payloads of Secrets (or other configured resource types) without OpenBao access. Object metadata and resource types not configured for encryption remain readable, and authorized clients of a running cluster receive plaintext as normal — this is encryption at rest, not access control.
 
 ### 9.2. Key isolation between tenants
 
-Key material is isolated at three levels: an OpenBao **namespace per organization** — a kernel-level barrier where cross-namespace reads return not-found — a **mount per project** inside that namespace, and a **Transit key per cluster** inside that mount. Key isolation is enforced by the key store itself, not by application-level filtering.
+Key material is isolated at three levels: an OpenBao **namespace per organization** — OpenBao-enforced namespace and policy isolation, where cross-namespace reads return not-found — a **mount per project** inside that namespace, and a **Transit key per cluster** inside that mount. Key isolation is enforced by the key store itself, not by application-level filtering.
 
 ### 9.3. Key rotation
 
@@ -548,7 +541,7 @@ The complete threat model, including an explicit table of what encryption-at-res
 Customers requiring assurance about CloudSigma-side access have a documented, auditable model:
 
 - **A single bastion host** is the only network entry to the management platform; control-plane nodes have no public IPs and SSH is public-key-only.
-- **A GitOps repository is the only configuration-change path.** No operator runs ad-hoc changes against the platform; every change is a reviewed commit with signed history.
+- **A GitOps repository is the administrative configuration-change path.** Operators do not run ad-hoc changes against the platform; administrative changes are reviewed commits with signed history.
 - **Secrets in that repository are encrypted at rest** with a committed, auditable list of authorized decryption keys.
 - **Two access tiers:** day-to-day access via SSO with a per-engineer identity recorded in every audit entry, and a break-glass path that is rotated after every use, with the rotation itself recorded as a commit.
 
@@ -586,9 +579,9 @@ flowchart LR
 - **Schedule and retention** are customer-configurable per cluster.
 - **Backups inherit encryption.** For clusters with encryption-at-rest enabled, the snapshot is wrapped by the same customer-scoped key — a stolen backup archive is ciphertext. Encrypted snapshots are labelled as such in the snapshot picker.
 - **Backup status is reported on the cluster**, including the timestamp and identifier of the most recent successful snapshot, so a failing backup is visible rather than silent.
-- **On-demand snapshots.** *Take snapshot now* runs a one-off job with the same configuration as the daily backup, with the cluster staying online.
-- **Self-service restore.** The customer picks any retained snapshot in the WebApp and restores the control plane to it. The tenant API is unreachable for roughly 60–120 seconds during the restore; workload pods on worker nodes keep running throughout. Control-plane state created after the snapshot is lost — the WebApp states this before the action is confirmed.
-- **Deleting a cluster retains its snapshots** in the backup bucket, so an accidental deletion is not a data-loss event for control-plane state.
+- **On-demand snapshots.** *Take snapshot now* runs a one-off job with the same storage and encryption settings as the scheduled backups, with the cluster staying online.
+- **Self-service restore.** The customer picks any retained snapshot in the WebApp and restores the control plane to it. The tenant API is unavailable during the restore — typically on the order of one to two minutes, depending on snapshot size — while workload pods on worker nodes keep running throughout. Control-plane state created after the snapshot is lost; the WebApp states this before the action is confirmed.
+- **Deleting a cluster retains its snapshots** in the backup bucket according to the configured retention, so control-plane state remains recoverable up to the most recent successful snapshot.
 
 ### 10.2. Workload state
 
@@ -596,7 +589,7 @@ Control-plane snapshots cover Kubernetes object state, not the contents of Persi
 
 ### 10.3. High availability
 
-The control plane runs with multiple replicas and automatic failover; etcd runs highly available and can be **dedicated per cluster** for customers who require physical separation of their control-plane state from other tenants, or **shared** for cost efficiency. Worker-node failure is handled by ordinary Kubernetes rescheduling, and pool rollouts respect PodDisruptionBudgets so availability constraints declared by the customer are honoured during every platform-initiated node replacement.
+HA configurations run multiple control-plane and etcd replicas with automatic rescheduling and failover; a single-replica etcd configuration is not highly available. etcd can be **dedicated per cluster** — a dedicated datastore instance for stronger tenant isolation — or **shared** for cost efficiency. Worker-node failure is handled by ordinary Kubernetes rescheduling, and pool rollouts honour PodDisruptionBudgets during drain (up to the pool's configured drain timeout, after which forced removal may proceed).
 
 ![Restore from backup in the Danger Zone](img/mk8s-10-backup-config.png)
 
@@ -635,7 +628,7 @@ The service is deliberately built to avoid lock-in, consistent with CloudSigma's
 
 ## 13. Service Support & SLA
 
-Managed Kubernetes is covered by the CloudSigma support channels and service levels described in sections 15 and 16 of the parent *Platform Capabilities* document: 24/7 live support via chat, email, phone and ticketing, with a response-time guarantee of under one hour across all channels and typically immediate response on live chat.
+Managed Kubernetes is covered by the CloudSigma support channels and service levels described in sections 15 and 16 of the parent *Platform Capabilities* document — 24/7 live support via chat, email, phone and ticketing. Response targets are those defined in the parent document and the customer's contracted support plan.
 
 Support scope specific to this service:
 
@@ -672,24 +665,3 @@ The following capabilities are in active development. Items are listed because t
 | [encryption-at-rest-design.md](encryption-at-rest-design.md) | Full key hierarchy, threat model and isolation design |
 | [operator-access-controls.md](operator-access-controls.md) | How CloudSigma operators access the platform, and how it is audited |
 | [cve-2026-43284-dirty-frag-mitigation.md](cve-2026-43284-dirty-frag-mitigation.md) | Worked example of the vulnerability-response process |
-
----
-
-## Screenshot index
-
-Screenshots live in `docs/img/`, captured from the CloudSigma marketplace WebApp.
-
-| File | Screen | Status |
-|---|---|---|
-| `mk8s-01-cluster-list.png` | Cluster list | ✅ Captured |
-| `mk8s-02-create-wizard.png` | Create Cluster | ✅ Captured |
-| `mk8s-03-cluster-summary.png` | Summary tab | ✅ Captured |
-| `mk8s-04-worker-pools.png` | Workers tab | ✅ Captured |
-| `mk8s-05-upgrade-wizard.png` | Upgrade wizard | ✅ Captured |
-| `mk8s-06-autoscaling-status.png` | Worker pool autoscaling controls | ✅ Captured |
-| `mk8s-09-endpoints-kubeconfig.png` | Break-glass public API panel | ✅ Captured |
-| `mk8s-10-backup-config.png` | Snapshot picker + self-service restore | ✅ Captured |
-| `mk8s-logging-grafana.png` | Control-plane log dashboard (Grafana) | ✅ Captured |
-| ~~`mk8s-07-storage.png`~~ | Storage | Replaced by live `kubectl` console examples (§6) |
-| ~~`mk8s-08-network-tab.png`~~ | Networking | No such WebApp tab exists — replaced by live in-cluster console examples (§7.5) |
-| ~~`mk8s-11-events-tab.png`~~ | Events tab | Superseded by the Grafana control-plane log dashboard |
