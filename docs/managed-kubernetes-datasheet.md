@@ -274,35 +274,51 @@ Full operational guidance, including recommendations for clusters with 20+ nodes
 
 ## 5. Autoscaling
 
-### 5.1. Control-plane vertical autoscaling — available
+### 5.1. Control-plane and etcd vertical autoscaling — available
 
-Every managed control plane is continuously right-sized by a **Vertical Pod Autoscaler (VPA)**. The recommender observes actual CPU and memory consumption of the API server, controller manager and scheduler, and produces target, lower-bound and upper-bound recommendations that are surfaced on the cluster's status.
+When a cluster's control plane needs more resources, it gets them automatically: **both the control-plane pod and its etcd datastore are continuously right-sized by dedicated Vertical Pod Autoscalers**, one per layer. The recommenders observe actual CPU and memory consumption and produce target, lower-bound and upper-bound recommendations; the updaters apply them within per-container safety bounds. The active mode is visible on every cluster:
 
-This directly addresses the failure mode that statically sized control planes suffer under: an API server whose memory limit was set for a small cluster gets OOM-killed once the cluster's object count, CRD surface or list-watch traffic grows — taking `kubectl exec`, `kubectl logs`, the controller manager and the scheduler down with it.
+```console
+$ kubectl get kdccluster
+NAME        VERSION   PHASE   ENDPOINT                                    DATASTORE        VPA
+tsap-test   v1.36.2   Ready   https://tsap-test-cp-….cloudsigma.com:443   tsap-test-etcd   InPlaceOrRecreate
+```
 
-Four modes are supported:
+This directly addresses the failure mode that statically sized control planes suffer under: an API server or etcd whose memory limit was set for a small cluster gets OOM-killed once the cluster's object count, CRD surface or list-watch traffic grows — taking `kubectl` access, the controller manager and the scheduler down with it.
 
-- **`Off`** — recommendation-only. Sizing signals are computed and reported, nothing is changed. Applied to every cluster as a baseline.
-- **`Initial`** — recommendations are injected when a control-plane pod is created, never applied by eviction.
+**The control-plane autoscaler** covers every container in the hosted control plane — API server, controller manager, scheduler, konnectivity and the KMS plugin — with per-container floors and ceilings. The floors are deliberately non-trivial: they were raised from production incident analysis so that an idle control plane can never be shrunk to the point where probe deadlines start failing. The API-server ceiling (2 CPU / 6 Gi by default) is raised per cluster where a genuinely heavy tenant needs it. It never resizes below the configured replica count, and if an operator pins static resources on a cluster, the autoscaler steps back to recommendation-only rather than fight the override.
+
+**The etcd autoscaler** targets the cluster's etcd separately, with quorum as a hard invariant:
+
+- The updater is pinned to the etcd replica count, so a resize can **never evict below quorum** — a 3-replica etcd is resized one member at a time.
+- A **single-replica etcd is never evicted for a resize at all**: it runs in `Initial` mode, where the new size is applied at the next natural restart instead of by disruption.
+- Bounds default to 1 CPU / 4 Gi per member — sized from a real etcd OOM incident class — and are operator-adjustable per cluster.
+
+Four modes are supported on either layer:
+
+- **`Off`** — recommendation-only. Sizing signals are computed and reported, nothing is changed.
+- **`Initial`** — recommendations are applied when a pod is created, never by eviction.
 - **`Recreate`** — pods are evicted to apply new sizes. Effective but disruptive.
-- **`InPlaceOrRecreate`** *(default)* — uses Kubernetes 1.33+ in-place pod resize where possible, falling back to eviction only when in-place resize is not applicable. **CPU resizing is restart-free.**
-
-A per-cluster upper bound governs how large the recommender may go, so a single heavy tenant cannot exhaust management-cluster capacity through inflated resource requests. The bound is raised on request for clusters whose API server working set legitimately exceeds the default.
+- **`InPlaceOrRecreate`** *(default)* — uses Kubernetes in-place pod resize where possible, falling back to eviction only when in-place resize is not applicable. **CPU resizing is restart-free.**
 
 ```mermaid
 flowchart LR
-    M["Control-plane pods<br/>apiserver / KCM / scheduler"] -->|"CPU + memory<br/>usage metrics"| R["VPA recommender"]
-    R -->|"target / lower / upper<br/>bounds"| S["Cluster status<br/><i>visible to customer</i>"]
+    M["Control-plane pod<br/>apiserver / KCM / scheduler<br/>konnectivity / KMS"] -->|"usage metrics"| R["VPA recommender"]
+    E[("etcd members")] -->|"usage metrics"| R2["etcd VPA recommender"]
+    R -->|"target / bounds"| S["Cluster status<br/><i>visible to customer</i>"]
     R --> U["VPA updater"]
+    R2 --> U2["etcd VPA updater<br/><i>quorum-pinned</i>"]
     U -->|"in-place resize<br/>(restart-free for CPU)"| M
     U -.->|"fallback: evict + recreate"| M
-    CAP["Per-cluster max bound<br/><i>protects shared capacity</i>"] --> R
+    U2 -->|"one member at a time,<br/>never below quorum"| E
+    CAP["Per-container floors + ceilings<br/><i>protect shared capacity and probe deadlines</i>"] --> R
+    CAP --> R2
 
     classDef n fill:#e8f0fe,stroke:#4285f4,color:#000
-    class M,R,S,U,CAP n
+    class M,E,R,R2,S,U,U2,CAP n
 ```
 
-*Control-Plane Vertical Autoscaling Loop*
+*Vertical autoscaling: one loop for the control-plane pod, a quorum-aware one for etcd*
 
 ### 5.2. Worker pool autoscaling
 
