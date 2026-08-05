@@ -111,6 +111,14 @@ Worker nodes are CloudSigma KVM virtual machines in the customer's own account, 
 | Kubelet tuning | CloudSigma applies | `maxPods`, reserved resources, eviction thresholds |
 | Namespaces, workloads, PVCs, Services, RBAC, NetworkPolicy | **Customer** | Full — never modified by CloudSigma |
 
+### 1.4. Multi-tenancy and isolation
+
+The service is multi-tenant by construction, with tenancy enforced at the **organization and project** level rather than bolted on per feature:
+
+- **Nothing in a cluster's control path is shared with another tenant.** Each cluster's API server, controller manager, scheduler and cloud controller run as that tenant's own instances, scoped to the tenant's project on the management platform. etcd is per cluster — shared across *your own* clusters or dedicated per cluster, never across tenants — and encryption keys live in a per-tenant OpenBao namespace (section 9.2).
+- **Control planes are unreachable from other tenants' networks.** Control-plane components run on a platform-internal network inside the management cluster. Tenant networks — project networks on the platform and worker VLANs alike — are separate SDN VPCs with no route to it. The only way to reach any cluster's API server is through that cluster's own published endpoints (section 8), authenticated by that cluster's own PKI; there is no network path from one tenant to another tenant's control plane.
+- **Workload networking is isolated per project.** Each project has its own VPC on the platform SDN; projects can reuse overlapping address ranges, and cross-project traffic is not routed.
+
 ![Kubernetes cluster list in the marketplace WebApp](img/mk8s-01-cluster-list.png)
 
 *The cluster list — each cluster with its phase (Ready / Provisioning), Kubernetes version, node count, and a one-click upgrade action when a newer version is available*
@@ -499,7 +507,7 @@ Cluster access is delivered as a standard `kubeconfig`, downloadable from the We
 
 ## 9. Security
 
-Security in the managed Kubernetes service is layered: encryption of cluster state at rest, strict multi-tenant isolation of key material, controlled and audited operator access, and the customer's own in-cluster controls.
+Security in the managed Kubernetes service is layered: the tenant-isolation model of section 1.4, encryption of cluster state at rest, strict multi-tenant isolation of key material, controlled and audited operator access, and the customer's own in-cluster controls.
 
 ### 9.1. Encryption at rest
 
