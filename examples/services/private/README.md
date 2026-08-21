@@ -60,16 +60,6 @@ kubectl apply -f nginx-loadbalancer.yaml
 curl http://10.8.0.6/
 ```
 
-## IP Pool Planning
-
-Reserve a range **outside the DHCP range** for MetalLB VIPs:
-
-| Range | Purpose |
-|-------|---------|
-| `10.8.0.1` | NAT gateway VM |
-| `10.8.0.2-10.8.0.9` | **MetalLB pool** (static VIPs) |
-| `10.8.0.10-10.8.0.250` | DHCP range (worker nodes) |
-
 ## Troubleshooting
 
 **Service stuck in `<pending>` state:**

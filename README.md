@@ -28,7 +28,7 @@ Expose services on your **customer private VLAN** using MetalLB L2 mode.
 
 - Services **only reachable from your private VLAN** (e.g., 10.8.0.0/24)
 - **No public internet access** — fully isolated within customer network
-- MetalLB **auto-deployed* when `privateApiEndpointIP` is set
+- MetalLB **auto-deployed** when `privateApiEndpointIP` is set
 - Uses **worker NIC 2** (ens4) on the customer VLAN
 
 **Documentation:** [`examples/services/private/README.md`](examples/services/private/README.md)
@@ -149,9 +149,9 @@ DHCP_RANGE_START="10.8.0.10"
 DHCP_RANGE_END="10.8.0.250"
 ```
 
-Configure in MetalLB `IPAddressPool`:
+Configure in MetalLB `IPAddressPool` — start **above** the API endpoint:
 ```yaml
 spec:
   addresses:
-  - 10.8.0.2-10.8.0.9
+  - 10.8.0.6-10.8.0.9
 ```
