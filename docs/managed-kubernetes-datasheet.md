@@ -357,7 +357,7 @@ The storage system maintains three replicas across separate servers and is desig
 
 **Object storage** for workloads that need it (artifacts, backups, media) is available from the CloudSigma object storage service and consumed from a cluster with any S3-compatible client or operator.
 
-**In practice** — a 5 Gi claim on a live cluster (`tsap-test`, zrh region), from claim to mounted filesystem. The default StorageClass binds on first consumer, the CSI driver provisions and attaches the DSSD volume, and the pod sees an ordinary block device (output abridged):
+**In practice** — a 5 Gi claim on a live cluster (on a live managed cluster), from claim to mounted filesystem. The default StorageClass binds on first consumer, the CSI driver provisions and attaches the DSSD volume, and the pod sees an ordinary block device (output abridged):
 
 ```console
 $ kubectl get storageclass
@@ -416,7 +416,7 @@ A **kube-api-proxy** component runs in every cluster so that `kubernetes.default
 
 Add-ons are continuously reconciled against a tested baseline, which keeps every cluster identical and predictable. Full per-add-on detail — what is configurable, what is reverted, and the common operations for each — is in [cluster-addons.md](cluster-addons.md).
 
-**In practice** — the two LoadBalancer models on live clusters in the zrh region (output abridged). On a **public cluster**, a plain unannotated `type=LoadBalancer` Service gets a CloudSigma static IP attached, tagged and routed by the CCM within seconds:
+**In practice** — the two LoadBalancer models on live managed clusters (output abridged). On a **public cluster**, a plain unannotated `type=LoadBalancer` Service gets a CloudSigma static IP attached, tagged and routed by the CCM within seconds:
 
 ```console
 $ kubectl get svc web

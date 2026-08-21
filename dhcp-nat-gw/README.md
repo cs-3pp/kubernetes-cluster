@@ -109,11 +109,12 @@ All settings are in `config.env`. Key parameters:
 
 | Variable | Description | Example |
 |---|---|---|
-| `CS_API_BASE` | CloudSigma API endpoint | `https://zrh.cloudsigma.com/api/2.0` |
-| `CS_USER` / `CS_PASS` | API credentials | |
-| `CLOUD_VLAN_UUID` | Shared cloud VLAN UUID | `eb22472a-...` |
+| `CS_API_BASE` | CloudSigma API endpoint | `https://<region>.cloudsigma.com/api/2.0` |
+| `CS_USER` / `CS_PASS` | API credentials for the account that owns the customer VLAN | |
+| `LIB_DRIVE_UUID` | Ubuntu 24.04 LTS library drive | **region-specific — look it up** |
+| `CLOUD_VLAN_UUID` | Shared cloud VLAN UUID | from your account |
 | `CLOUD_VLAN_IP` | Static IP on cloud VLAN | `100.64.200.1` |
-| `CUSTOMER_VLAN_UUID` | Customer private VLAN UUID | `09d36477-...` |
+| `CUSTOMER_VLAN_UUID` | Customer private VLAN UUID | from your account |
 | `CUSTOMER_VLAN_IP` | Gateway IP on customer VLAN | `10.8.0.1` |
 | `DHCP_RANGE_START/END` | DHCP allocation range | `10.8.0.10` - `10.8.0.250` |
 
@@ -124,7 +125,7 @@ All settings are in `config.env`. Key parameters:
 | NIC | Interface | Network | Purpose |
 |-----|-----------|---------|---------|
 | 0 | `ens3` | Public (DHCP) | Internet uplink, SSH access |
-| 1 | `ens4` | Cloud VLAN (static) | Visibility into mgmt network |
+| 1 | `ens4` | Cloud VLAN (static) | Visibility into the platform network |
 | 2 | `ens5` | Customer VLAN (static) | DHCP server + NAT gateway |
 
 ### Services
@@ -186,4 +187,60 @@ dhcp-nat-gw/
 ├── vm-uuid.txt          # Created by provision.sh (git-ignored)
 ├── vm-ip.txt            # Created by provision.sh (git-ignored)
 └── README.md            # This file
+```
+
+## Notes from a live deployment
+
+Things that are easy to get wrong, all of them observed rather than guessed.
+
+### The library drive UUID is per-region
+
+The same `Ubuntu 24.04 LTS` image has a **different UUID in every region**. A
+config copied from another region fails at the very first step, when the clone
+returns 404. List them for your region and pick the plain image — not one of
+the `Ubuntu 24.04 LTS k8s x.y.z` worker images:
+
+```bash
+curl -su "$CS_USER:$CS_PASS" \
+  "https://<region>.cloudsigma.com/api/2.0/libdrives/detail/?limit=0" \
+  | python3 -c "import sys,json; [print(o['uuid'], o['name']) \
+      for o in json.load(sys.stdin)['objects'] if '24.04' in (o.get('name') or '')]"
+```
+
+### Choosing `CLOUD_VLAN_IP`
+
+The cloud VLAN is shared, and the platform already owns two ranges on it: a
+reserved block at the bottom of the subnet (gateways, anchors, platform VIPs)
+and the pool it allocates managed-K8s worker addresses from. Pick a high host
+address clear of both. If you take an address inside the worker pool, a worker
+created later gets the same IP and one of the two silently stops working.
+
+### The gateway cannot reach the cluster's control plane — by design
+
+Once running, this VM can ping other hosts on the cloud VLAN but **not** the
+managed cluster's API endpoint. That is correct, not a fault: the platform
+allows the worker pool's addresses into the tenant network and nothing else, so
+a VM you place on that VLAN yourself is not on the list.
+
+Workers reach their own control plane through their own cloud-VLAN address. The
+gateway's cloud-VLAN NIC is for visibility, not for cluster access. Use the
+private API endpoint (see the private-services example) if you want `kubectl`
+from the customer VLAN.
+
+### Verifying it actually works
+
+The gateway is doing its job when a worker appears in the lease file and NAT
+counters move:
+
+```bash
+sudo cat /var/lib/misc/dnsmasq.leases          # a worker should appear here
+sudo iptables -t nat -L POSTROUTING -n -v | grep MASQUERADE
+```
+
+From inside the cluster, the definitive check is which address a pod leaves as —
+it should be this gateway's public IP, never the cloud VLAN:
+
+```bash
+kubectl run egress --rm -it --restart=Never --image=busybox:1.36 \
+  -- wget -qO- http://ifconfig.me/ip
 ```

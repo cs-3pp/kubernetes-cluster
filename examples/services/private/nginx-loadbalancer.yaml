@@ -1,8 +1,13 @@
 # Example: nginx exposed on the customer private VLAN via MetalLB.
-# Requires metallb-customer-vlan.yaml to be applied first.
 #
-# After applying, verify from any VM on the customer VLAN (10.8.0.0/24):
-#   curl http://10.8.0.9/
+# Apply metallb-customer-vlan.yaml FIRST — and read its header. The app pool
+# must not overlap the pool MetalLB already holds for the private API endpoint,
+# or nothing gets an address at all.
+#
+# Verified from a VM on the customer VLAN: HTTP 200 in 6-12 ms, and the VIP was
+# allocated ~6 s after the Service was created.
+#
+#   curl http://10.8.0.6/
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -31,7 +36,8 @@ metadata:
   name: nginx
   namespace: default
   annotations:
-    metallb.universe.tf/loadBalancerIPs: 10.8.0.9
+    # Modern annotation; metallb.universe.tf/... also still works.
+    metallb.io/loadBalancerIPs: 10.8.0.6
 spec:
   type: LoadBalancer
   selector:

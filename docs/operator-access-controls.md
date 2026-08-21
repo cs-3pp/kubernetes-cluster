@@ -32,7 +32,7 @@ Each CloudSigma region runs one bastion VM in front of the management cluster:
 
 ```
                             ┌──────────────────────────────────────┐
-                            │  CloudSigma region (e.g. zrh)         │
+                            │  CloudSigma region                    │
                             │                                       │
    Operator workstation     │  ┌─────────────────────────────────┐  │
    ─────────────────────────┼─►│ Bastion VM                      │  │

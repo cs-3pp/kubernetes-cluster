@@ -198,7 +198,7 @@ OpenBao is shared infrastructure: one OpenBao cluster per CloudSigma region serv
                           │  └──────────────────────────────────────────────────┘│
                           │                                                      │
                           │  ┌──────────────────────────────────────────────────┐│
-   Your Organization      │  │  YourOrg's namespace (e.g. "tsap/")              ││
+   Your Organization      │  │  YourOrg's namespace (e.g. "yourorg/")              ││
    ──────────────────────►│  │  HARD ISOLATION BOUNDARY                         ││
                           │  │  ─ cross-namespace reads return 404, ALWAYS      ││
                           │  │                                                  ││
@@ -231,7 +231,7 @@ OpenBao is shared infrastructure: one OpenBao cluster per CloudSigma region serv
 
 Three nested boundaries:
 
-1. **OpenBao Namespace per Organization.** OpenBao's namespace feature is a kernel-level isolation primitive — a token issued in `tsap/` literally cannot read anything in `otherorg/`; the OpenBao server returns 404, not "permission denied". This means a policy bug at the project level cannot escalate to a cross-Organization read.
+1. **OpenBao Namespace per Organization.** OpenBao's namespace feature is a kernel-level isolation primitive — a token issued in `yourorg/` literally cannot read anything in `otherorg/`; the OpenBao server returns 404, not "permission denied". This means a policy bug at the project level cannot escalate to a cross-Organization read.
 2. **Per-project Transit mount inside the Org namespace.** Each project gets its own `<project>/transit/` mount. A bug in one project's policy can't leak into a sibling project's keys.
 3. **Per-cluster key inside the project mount.** Each cluster's KEK has a unique name `<project>-<cluster>-etcd`. Per-key ACL paths in the OpenBao policy further narrow which roles can `wrap`/`unwrap`/`rotate`.
 

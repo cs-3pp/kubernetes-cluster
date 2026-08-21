@@ -1,34 +1,52 @@
-# MetalLB configuration for customer private VLAN service exposure.
-# Deploy this on the customer cluster (e.g. remote-vlan) after installing MetalLB.
+# MetalLB pool for exposing YOUR OWN services on the customer private VLAN.
+#
+# READ THIS FIRST — on a managed cluster created with `privateApiEndpointIP`
+# set, MetalLB is ALREADY installed and already has a pool, holding exactly the
+# private API endpoint address (a /32). You are adding a SECOND pool for your
+# applications, so:
+#
+#   *** THE TWO POOLS MUST NOT OVERLAP. ***
+#
+# MetalLB rejects an overlapping configuration WHOLESALE. It does not just skip
+# the bad pool — it stops allocating for every Service, and the only symptom is
+#   Failed to allocate IP for "ns/svc": ["10.8.0.9"] is not allowed in config
+# on a Service whose address plainly IS inside a pool you can see with
+# `kubectl get ipaddresspools -A`. Nothing marks the pool itself as invalid.
+#
+# So carve the app range ABOVE the API endpoint. With the endpoint at 10.8.0.5
+# and the DHCP range starting at 10.8.0.10, that leaves .6-.9 for applications:
+#
+#   10.8.0.1        gateway VM (dhcp-nat-gw)
+#   10.8.0.5        private kube-api endpoint  <- MetalLB owns this already
+#   10.8.0.6-.9     your service VIPs          <- this pool
+#   10.8.0.10-.250  DHCP range (dnsmasq)       <- never put a VIP here
+#
+# Check what already exists before applying:
+#   kubectl get ipaddresspools.metallb.io -A \
+#     -o custom-columns=NAME:.metadata.name,ADDRS:.spec.addresses
 #
 # The L2Advertisement is pinned to `ens4` — the worker NIC on the customer VLAN.
-# The IP pool must be within the customer VLAN subnet (e.g. 10.8.0.0/24).
-# IPs in the pool must not be in the DHCP range (dnsmasq: 10.8.0.10–10.8.0.250).
-# Safe range for static VIPs: 10.8.0.2–10.8.0.9
 #
-# Install MetalLB first:
-#   kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
-#
-# Note: The MetalLB validating webhook cannot be reached from a Kube-DC-hosted
-# kube-apiserver. Delete it after install:
-#   kubectl delete validatingwebhookconfiguration metallb-webhook-configuration
+# MetalLB is auto-installed on these clusters; you do NOT need to install it or
+# delete its webhook. Both pools below applied cleanly with the webhook present.
 ---
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata:
-  name: customer-vlan-pool
+  name: customer-vlan-apps
   namespace: metallb-system
 spec:
   addresses:
-  - 10.8.0.2-10.8.0.9
+  # Must not include the private API endpoint address.
+  - 10.8.0.6-10.8.0.9
 ---
 apiVersion: metallb.io/v1beta1
 kind: L2Advertisement
 metadata:
-  name: customer-vlan-l2
+  name: customer-vlan-apps-l2
   namespace: metallb-system
 spec:
   ipAddressPools:
-  - customer-vlan-pool
+  - customer-vlan-apps
   interfaces:
   - ens4

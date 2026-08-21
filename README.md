@@ -98,6 +98,21 @@ The gateway VM provides:
 - **Customer VLAN (ens4):** DHCP-assigned IP, default route via NAT gateway
 - **Internet traffic:** Routes through NAT gateway on customer VLAN
 
+## Persistent Storage
+
+The CloudSigma CSI driver is preinstalled. One default StorageClass is created,
+named for the drive tier the account subscribes to — and that tier **differs
+between locations**, so omit `storageClassName` rather than hardcoding it.
+
+```bash
+kubectl get storageclass
+kubectl apply -f examples/storage/pvc-and-pod.yaml
+```
+
+A claim with no Pod stays `Pending` by design (`WaitForFirstConsumer`). See
+[`storage/README.md`](examples/storage/README.md) for the full notes and
+expected timings.
+
 ---
 
 ## Quick Reference
@@ -108,6 +123,7 @@ The gateway VM provides:
 | Expose to private VLAN | MetalLB L2 | [`nginx-loadbalancer.yaml`](examples/services/private/nginx-loadbalancer.yaml) |
 | Configure MetalLB | Auto | [`private/README.md`](examples/services/private/README.md) |
 | Set up DHCP/NAT GW | Provision script | [`dhcp-nat-gw/`](dhcp-nat-gw/) |
+| Persistent storage | CloudSigma CSI (preinstalled) | [`storage/`](examples/storage/) |
 
 ---
 
@@ -118,8 +134,14 @@ Reserve ranges outside the DHCP pool for static services:
 | Range | Purpose |
 |-------|---------|
 | `10.8.0.1` | NAT gateway VM |
-| `10.8.0.2-10.8.0.9` | MetalLB static VIPs |
+| `10.8.0.5` | Private kube-api endpoint — **MetalLB already owns this** |
+| `10.8.0.6-10.8.0.9` | MetalLB VIPs for your services |
 | `10.8.0.10-10.8.0.250` | DHCP range (worker nodes) |
+
+> An application IP pool must **not** include the private API endpoint address.
+> MetalLB rejects overlapping pools wholesale and then allocates nothing at all,
+> reporting only that your requested address `is not allowed in config`. See
+> [`private/README.md`](examples/services/private/README.md).
 
 Configure in `dhcp-nat-gw/config.env`:
 ```bash
