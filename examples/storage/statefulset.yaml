@@ -5,7 +5,7 @@
 # several replicas cannot share one claim.
 #
 # Deliberately no storageClassName: the cluster's default StorageClass is used,
-# so the same manifest applies in any location regardless of which drive tier
+# so the same manifest applies in any location regardless of which storage type
 # that account subscribes to.
 ---
 apiVersion: v1

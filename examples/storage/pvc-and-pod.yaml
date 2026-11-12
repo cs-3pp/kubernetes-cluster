@@ -1,15 +1,15 @@
 # Example: persistent storage on a managed Kubernetes cluster.
 #
 # The CloudSigma CSI driver is installed automatically and creates ONE default
-# StorageClass whose name matches the drive tier your account subscribes to —
-# `cloudsigma-<tier>`. Check what you have before writing manifests:
+# StorageClass whose name matches the storage type your account subscribes to —
+# `cloudsigma-<type>`. Check what you have before writing manifests:
 #
 #   kubectl get storageclass
 #
 # Because it is the default, `storageClassName` can be omitted entirely; it is
 # spelled out here only to show where it goes. Omitting it is the portable
-# choice — the tier differs between locations, so a manifest that hardcodes one
-# tier will not apply everywhere.
+# choice — the storage type differs between locations, so a manifest that hardcodes
+# one will not apply everywhere.
 #
 # Two behaviours worth knowing before you debug something that is working:
 #
@@ -27,7 +27,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  # storageClassName: cloudsigma-<tier>   # omit to use the default
+  # storageClassName: cloudsigma-<type>   # omit to use the default
   resources:
     requests:
       storage: 5Gi

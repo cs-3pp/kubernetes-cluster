@@ -101,8 +101,8 @@ The gateway VM provides:
 ## Persistent Storage
 
 The CloudSigma CSI driver is preinstalled. One default StorageClass is created,
-named for the drive tier the account subscribes to — and that tier **differs
-between locations**, so omit `storageClassName` rather than hardcoding it.
+named for the storage type the account subscribes to — and that storage type
+**differs between locations**, so omit `storageClassName` rather than hardcoding it.
 
 ```bash
 kubectl get storageclass
@@ -112,6 +112,13 @@ kubectl apply -f examples/storage/pvc-and-pod.yaml
 A claim with no Pod stays `Pending` by design (`WaitForFirstConsumer`). See
 [`storage/README.md`](examples/storage/README.md) for the full notes and
 expected timings.
+
+**Performance tiers.** Where CloudSigma offers storage tiers for your account
+and location, your cluster may have extra classes next to the default (for
+example `cloudsigma-nvme-basic`, `cloudsigma-nvme-fast`,
+`cloudsigma-nvme-super-fast`; run `kubectl get storageclass` to see yours);
+pick one per claim with `storageClassName`. See
+[Performance tiers](examples/storage/README.md#performance-tiers).
 
 ---
 
@@ -124,6 +131,7 @@ expected timings.
 | Configure MetalLB | Auto | [`private/README.md`](examples/services/private/README.md) |
 | Set up DHCP/NAT GW | Provision script | [`dhcp-nat-gw/`](dhcp-nat-gw/) |
 | Persistent storage | CloudSigma CSI (preinstalled) | [`storage/`](examples/storage/) |
+| Select a storage performance tier | Tier StorageClass | [`pvc-performance-tier.yaml`](examples/storage/pvc-performance-tier.yaml) |
 
 ---
 
